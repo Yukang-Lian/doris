@@ -33,8 +33,6 @@
 #include "util/debug_util.h"
 
 namespace doris {
-namespace segment_v2 {
-
 class BinaryDictPageTest : public testing::Test {
 public:
     void test_by_small_data_size(const std::vector<Slice>& slices) {
@@ -254,6 +252,4 @@ TEST_F(BinaryDictPageTest, TestEncodingRatio) {
     LOG(INFO) << "source line number:" << slices.size();
     test_with_large_data_size(slices);
 }
-
-} // namespace segment_v2
 } // namespace doris

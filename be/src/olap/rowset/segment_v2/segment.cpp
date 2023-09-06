@@ -103,9 +103,15 @@ Status Segment::_open() {
 
 Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_options,
                              std::unique_ptr<RowwiseIterator>* iter) {
+    LOG(WARNING) << "----------------------------------start segment iterator";
+    MonotonicStopWatch timer;
+    timer.start();
     read_options.stats->total_segment_number++;
+    int32_t i = 0;
     // trying to prune the current segment by segment-level zone map
     for (auto& entry : read_options.col_id_to_predicates) {
+        i++;
+        LOG(WARNING) << "-----3-1-1-1-1 timer1."<<i<<" " << timer.elapsed_time() / 1000;
         int32_t column_id = entry.first;
         // schema change
         if (_tablet_schema->num_columns() <= column_id) {
@@ -123,6 +129,7 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
             return Status::OK();
         }
     }
+    LOG(WARNING) << "-----3-1-1-1-1 timer1 " << timer.elapsed_time() / 1000;
 
     if (read_options.use_topn_opt) {
         auto query_ctx = read_options.runtime_state->get_query_ctx();
@@ -141,6 +148,7 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
             }
         }
     }
+    LOG(WARNING) << "-----3-1-1-1-1 timer2 " << timer.elapsed_time() / 1000;
 
     RETURN_IF_ERROR(load_index());
     if (read_options.delete_condition_predicates->num_of_column_predicate() == 0 &&
@@ -150,8 +158,17 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
     } else {
         iter->reset(new SegmentIterator(this->shared_from_this(), schema));
     }
+    auto t3 = timer.elapsed_time() / 1000;
+    LOG(WARNING) << "-----3-1-1-1-1 timer3 " << t3;
 
-    return iter->get()->init(read_options);
+    auto p = iter->get();
+    auto t4 = timer.elapsed_time() / 1000;
+    LOG(WARNING) << "-----3-1-1-1-1 timer4 " << t4;
+
+    Status s = p->init(read_options);
+    auto t5 = timer.elapsed_time() / 1000;
+    LOG(WARNING) << "-----3-1-1-1-1 timer5 " << t5;
+    return s;
 }
 
 Status Segment::_parse_footer() {

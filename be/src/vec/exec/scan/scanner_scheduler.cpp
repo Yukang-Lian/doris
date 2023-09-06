@@ -337,6 +337,7 @@ void ScannerScheduler::_scanner_scan(ScannerScheduler* scheduler, ScannerContext
     RuntimeState* state = ctx->state();
     DCHECK(nullptr != state);
     if (!scanner->is_init()) {
+        SCOPED_TIMER(scanner->get_parent()->_open_timer_flag_1);
         status = scanner->init();
         if (!status.ok()) {
             ctx->set_status_on_error(status);
@@ -350,6 +351,7 @@ void ScannerScheduler::_scanner_scan(ScannerScheduler* scheduler, ScannerContext
         }
     }
     if (!eos && !scanner->is_open()) {
+        SCOPED_TIMER(scanner->get_parent()->_open_timer_flag_2);
         status = scanner->open(state);
         if (!status.ok()) {
             ctx->set_status_on_error(status);

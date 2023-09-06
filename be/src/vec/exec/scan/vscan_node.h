@@ -176,6 +176,9 @@ public:
     };
 
     RuntimeProfile* scanner_profile() { return _scanner_profile.get(); }
+    RuntimeProfile::Counter* _open_timer_flag_1 = nullptr;
+    RuntimeProfile::Counter* _open_timer_flag_2 = nullptr;
+    RuntimeProfile::Counter* _open_timer_flag_3 = nullptr;
 
 protected:
     // Different data sources register different profiles by implementing this method

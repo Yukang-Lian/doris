@@ -77,7 +77,11 @@ bool BetaRowsetReader::update_profile(RuntimeProfile* profile) {
 Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context,
                                                std::vector<RowwiseIteratorUPtr>* out_iters,
                                                const RowSetSplits& rs_splits, bool use_cache) {
+    LOG(WARNING) << "----------------------start segment";
+    MonotonicStopWatch timer;
+    timer.start();
     RETURN_IF_ERROR(_rowset->load());
+    LOG(WARNING) << "-----3-1-1-1 timer1 " << timer.elapsed_time() / 1000;
     _context = read_context;
     // The segment iterator is created with its own statistics,
     // and the member variable '_stats'  is initialized by '_stats(&owned_stats)'.
@@ -109,6 +113,7 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
                                                   read_context->is_upper_keys_included->at(i));
         }
     }
+    LOG(WARNING) << "-----3-1-1-1 timer2 " << timer.elapsed_time() / 1000;
 
     // delete_hanlder is always set, but it maybe not init, so that it will return empty conditions
     // or predicates when it is not inited.
@@ -117,6 +122,7 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
                 _rowset->end_version(), _read_options.delete_condition_predicates.get(),
                 &_read_options.del_predicates_for_zone_map);
     }
+    LOG(WARNING) << "-----3-1-1-1 timer3 " << timer.elapsed_time() / 1000;
 
     std::vector<uint32_t> read_columns;
     std::set<uint32_t> read_columns_set;
@@ -131,6 +137,7 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
             read_columns.push_back(cid);
         }
     }
+    LOG(WARNING) << "-----3-1-1-1 timer4 " << timer.elapsed_time() / 1000;
     VLOG_NOTICE << "read columns size: " << read_columns.size();
     std::string schema_key = SchemaCache::get_schema_key(
             _read_options.tablet_id, _context->tablet_schema, read_columns,
@@ -143,6 +150,7 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
         _input_schema = std::make_shared<Schema>(_context->tablet_schema->columns(), read_columns);
         SchemaCache::instance()->insert_schema(schema_key, _input_schema);
     }
+    LOG(WARNING) << "-----3-1-1-1 timer5 " << timer.elapsed_time() / 1000;
 
     if (read_context->predicates != nullptr) {
         _read_options.column_predicates.insert(_read_options.column_predicates.end(),
@@ -158,6 +166,7 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
                     single_column_block_predicate);
         }
     }
+    LOG(WARNING) << "-----3-1-1-1 timer6 " << timer.elapsed_time() / 1000;
 
     if (read_context->predicates_except_leafnode_of_andnode != nullptr) {
         _read_options.column_predicates_except_leafnode_of_andnode.insert(
@@ -181,6 +190,7 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
             _read_options.delete_bitmap.emplace(seg_id, std::move(d));
         }
     }
+    LOG(WARNING) << "-----3-1-1-1 timer7 " << timer.elapsed_time() / 1000;
 
     if (_should_push_down_value_predicates()) {
         if (read_context->value_predicates != nullptr) {
@@ -213,6 +223,7 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
     bool should_use_cache = use_cache || read_context->reader_type == ReaderType::READER_QUERY;
     RETURN_IF_ERROR(SegmentLoader::instance()->load_segments(_rowset, &_segment_cache_handle,
                                                              should_use_cache));
+    LOG(WARNING) << "-----3-1-1-1 timer8 " << timer.elapsed_time() / 1000;
 
     // create iterator for each segment
     auto& segments = _segment_cache_handle.get_segments();
@@ -221,11 +232,13 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
         seg_start = 0;
         seg_end = segments.size();
     }
+    LOG(WARNING) << "-----3-1-1-1 timer9 " << timer.elapsed_time() / 1000;
 
     for (int i = seg_start; i < seg_end; i++) {
         auto& seg_ptr = segments[i];
         std::unique_ptr<RowwiseIterator> iter;
         auto s = seg_ptr->new_iterator(_input_schema, _read_options, &iter);
+        LOG(WARNING) << "-----3-1-1-1 timer9A."<<i<<" "<< timer.elapsed_time() / 1000;
         if (!s.ok()) {
             LOG(WARNING) << "failed to create iterator[" << seg_ptr->id() << "]: " << s.to_string();
             return Status::Error<ROWSET_READER_INIT>(s.to_string());
@@ -234,16 +247,22 @@ Status BetaRowsetReader::get_segment_iterators(RowsetReaderContext* read_context
             continue;
         }
         out_iters->push_back(std::move(iter));
+        LOG(WARNING) << "-----3-1-1-1 timer9B."<<i<<" "<< timer.elapsed_time() / 1000;
     }
+    LOG(WARNING) << "-----3-1-1-1 timer10 " << timer.elapsed_time() / 1000;
 
     return Status::OK();
 }
 
 Status BetaRowsetReader::init(RowsetReaderContext* read_context, const RowSetSplits& rs_splits) {
+    LOG(WARNING) << "--------start beta rowset init iter";
+    MonotonicStopWatch timer;
+    timer.start();
     _context = read_context;
     _context->rowset_id = _rowset->rowset_id();
     std::vector<RowwiseIteratorUPtr> iterators;
     RETURN_IF_ERROR(get_segment_iterators(_context, &iterators, rs_splits));
+    LOG(WARNING) << "-----3-1-1 timer1 " << timer.elapsed_time() / 1000;
 
     // merge or union segment iterator
     if (read_context->need_ordered_result && _rowset->rowset_meta()->is_segments_overlapping()) {
@@ -259,15 +278,18 @@ Status BetaRowsetReader::init(RowsetReaderContext* read_context, const RowSetSpl
         _iterator = vectorized::new_merge_iterator(
                 std::move(iterators), sequence_loc, read_context->is_unique,
                 read_context->read_orderby_key_reverse, read_context->merged_rows);
+    LOG(WARNING) << "-----3-1-1 timer2 " << timer.elapsed_time() / 1000;
     } else {
         if (read_context->read_orderby_key_reverse) {
             // reverse iterators to read backward for ORDER BY key DESC
             std::reverse(iterators.begin(), iterators.end());
         }
         _iterator = vectorized::new_union_iterator(std::move(iterators));
+    LOG(WARNING) << "-----3-1-1 timer3 " << timer.elapsed_time() / 1000;
     }
 
     auto s = _iterator->init(_read_options);
+    LOG(WARNING) << "-----3-1-1 timer4 " << timer.elapsed_time() / 1000;
     if (!s.ok()) {
         LOG(WARNING) << "failed to init iterator: " << s.to_string();
         _iterator.reset();

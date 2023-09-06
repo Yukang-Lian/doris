@@ -212,6 +212,9 @@ SegmentIterator::SegmentIterator(std::shared_ptr<Segment> segment, SchemaSPtr sc
           _pool(new ObjectPool) {}
 
 Status SegmentIterator::init(const StorageReadOptions& opts) {
+    LOG(WARNING) << "----------------------------------start segment iterator init";
+    MonotonicStopWatch timer;
+    timer.start();
     // get file handle from file descriptor of segment
     if (_inited) {
         return Status::OK();
@@ -230,6 +233,7 @@ Status SegmentIterator::init(const StorageReadOptions& opts) {
             _col_predicates.emplace_back(predicate);
         }
     }
+    LOG(WARNING) << "-----3-1-1-1-1-1 timer1 " << timer.elapsed_time() / 1000;
     _tablet_id = opts.tablet_id;
     // Read options will not change, so that just resize here
     _block_rowids.resize(_opts.block_row_max);
@@ -245,6 +249,7 @@ Status SegmentIterator::init(const StorageReadOptions& opts) {
     for (auto& expr : _remaining_conjunct_roots) {
         _calculate_pred_in_remaining_conjunct_root(expr);
     }
+    LOG(WARNING) << "-----3-1-1-1-1-1 timer2 " << timer.elapsed_time() / 1000;
 
     _column_predicate_info.reset(new ColumnPredicateInfo());
     if (_schema->rowid_col_idx() > 0) {
@@ -252,6 +257,7 @@ Status SegmentIterator::init(const StorageReadOptions& opts) {
     }
 
     RETURN_IF_ERROR(init_iterators());
+    LOG(WARNING) << "-----3-1-1-1-1-1 timer3 " << timer.elapsed_time() / 1000;
     if (_char_type_idx.empty() && _char_type_idx_no_0.empty()) {
         _vec_init_char_column_id();
     }
@@ -259,13 +265,19 @@ Status SegmentIterator::init(const StorageReadOptions& opts) {
     if (opts.output_columns != nullptr) {
         _output_columns = *(opts.output_columns);
     }
+    LOG(WARNING) << "-----3-1-1-1-1-1 timer4 " << timer.elapsed_time() / 1000;
     return Status::OK();
 }
 
 Status SegmentIterator::init_iterators() {
+    MonotonicStopWatch timer;
+    timer.start();
     RETURN_IF_ERROR(_init_return_column_iterators());
+    LOG(WARNING) << "-----3-1-1-1-1-1 timerA " << timer.elapsed_time() / 1000;
     RETURN_IF_ERROR(_init_bitmap_index_iterators());
+    LOG(WARNING) << "-----3-1-1-1-1-1 timerB " << timer.elapsed_time() / 1000;
     RETURN_IF_ERROR(_init_inverted_index_iterators());
+    LOG(WARNING) << "-----3-1-1-1-1-1 timerC " << timer.elapsed_time() / 1000;
     return Status::OK();
 }
 
@@ -1482,10 +1494,13 @@ bool SegmentIterator::_can_evaluated_by_vectorized(ColumnPredicate* predicate) {
 }
 
 void SegmentIterator::_vec_init_char_column_id() {
+    LOG(WARNING) << "----------------------------------vec init char column id";
+    MonotonicStopWatch timer;
+    timer.start();
     for (size_t i = 0; i < _schema->num_column_ids(); i++) {
         auto cid = _schema->column_id(i);
         auto column_desc = _schema->column(cid);
-
+        LOG(WARNING) << "-----vec timer1."<<i<<" " << timer.elapsed_time() / 1000;
         do {
             if (column_desc->type() == FieldType::OLAP_FIELD_TYPE_CHAR) {
                 _char_type_idx.emplace_back(i);
@@ -1499,6 +1514,7 @@ void SegmentIterator::_vec_init_char_column_id() {
             // for Array<Char> or Array<Array<Char>>
             column_desc = column_desc->get_sub_field(0);
         } while (column_desc != nullptr);
+        LOG(WARNING) << "-----vec timer2."<<i<<" " << timer.elapsed_time() / 1000;
     }
 }
 

@@ -312,6 +312,9 @@ Status VScanNode::_init_profile() {
             ADD_COUNTER(_scanner_profile, "NewlyCreateFreeBlocksNum", TUnit::UNIT);
     // time of transfer thread to wait for block from scan thread
     _scanner_wait_batch_timer = ADD_TIMER(_scanner_profile, "ScannerBatchWaitTime");
+    _open_timer_flag_1 = ADD_TIMER(_scanner_profile, "openTimeFlag1");
+    _open_timer_flag_2 = ADD_TIMER(_scanner_profile, "openTimeFlag2");
+    _open_timer_flag_3 = ADD_TIMER(_scanner_profile, "openTimeFlag3");
     _scanner_sched_counter = ADD_COUNTER(_scanner_profile, "ScannerSchedCount", TUnit::UNIT);
     _scanner_ctx_sched_counter = ADD_COUNTER(_scanner_profile, "ScannerCtxSchedCount", TUnit::UNIT);
     _scanner_ctx_sched_time = ADD_TIMER(_scanner_profile, "ScannerCtxSchedTime");
