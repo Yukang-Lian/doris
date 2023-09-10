@@ -264,7 +264,7 @@ Status NewOlapScanner::open(RuntimeState* state) {
     RETURN_IF_ERROR(VScanner::open(state));
 
     SCOPED_TIMER(get_parent()->_open_timer_flag_3);
-    LOG(WARNING) << "Start OLAP scanner!";
+    LOG(INFO) << "point test: Start OLAP scanner!";
     auto res = _tablet_reader->init(_tablet_reader_params);
     if (!res.ok()) {
         std::stringstream ss;

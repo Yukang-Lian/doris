@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "common/status.h"
+#include "gutil/integral_types.h"
 #include "olap/field.h"
 #include "olap/iterators.h"
 #include "olap/olap_common.h"
@@ -375,6 +376,8 @@ private:
 };
 
 Status VUnionIterator::init(const StorageReadOptions& opts) {
+    MonotonicStopWatch timer;
+    timer.start();
     if (_origin_iters.empty()) {
         return Status::OK();
     }
@@ -383,12 +386,23 @@ Status VUnionIterator::init(const StorageReadOptions& opts) {
     // so reverse the vector here to keep result block of next_batch to be
     // in the same order as the original segments.
     std::reverse(_origin_iters.begin(), _origin_iters.end());
+    auto t0 = timer.elapsed_time();
+    std::vector<uint64_t> t1vec(_origin_iters.size());
 
+    size_t i = 0;
     for (auto& iter : _origin_iters) {
         RETURN_IF_ERROR(iter->init(opts));
+        t1vec[i] = timer.elapsed_time();
+        ++i;
     }
     _cur_iter = std::move(_origin_iters.back());
     _schema = &_cur_iter->schema();
+    auto t2 = timer.elapsed_time();
+    LOG(INFO) << "-----union init timer0 " << t0 / 1000;
+    for (size_t i = 0; i < _origin_iters.size(); ++i) {
+        LOG(INFO) << "-----union init timer1." << i << " " << t1vec[i] / 1000;
+    }
+    LOG(INFO) << "-----union init timer2 " << t2 / 1000;
     return Status::OK();
 }
 

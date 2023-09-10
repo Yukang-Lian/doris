@@ -110,40 +110,40 @@ bool BlockReader::_rowsets_overlapping(const ReaderParams& read_params) {
 }
 
 Status BlockReader::_init_collect_iter(const ReaderParams& read_params) {
-    LOG(WARNING) << "start init iter";
+    LOG(INFO) << "start init iter";
     MonotonicStopWatch timer;
     timer.start();
     auto res = _capture_rs_readers(read_params);
     if (!res.ok()) {
-        LOG(WARNING) << "fail to init reader when _capture_rs_readers. res:" << res
+        LOG(INFO) << "fail to init reader when _capture_rs_readers. res:" << res
                      << ", tablet_id:" << read_params.tablet->tablet_id()
                      << ", schema_hash:" << read_params.tablet->schema_hash()
                      << ", reader_type:" << int(read_params.reader_type)
                      << ", version:" << read_params.version;
         return res;
     }
-    LOG(WARNING) << "iter phase1 timer" << timer.elapsed_time() / 1000;
+    LOG(INFO) << "iter phase1 timer" << timer.elapsed_time() / 1000;
     // check if rowsets are noneoverlapping
     _is_rowsets_overlapping = _rowsets_overlapping(read_params);
-    LOG(WARNING) << "iter phase2 timer" << timer.elapsed_time() / 1000;
+    LOG(INFO) << "iter phase2 timer" << timer.elapsed_time() / 1000;
     _vcollect_iter.init(this, _is_rowsets_overlapping, read_params.read_orderby_key,
                         read_params.read_orderby_key_reverse);
-    LOG(WARNING) << "iter phase3 timer" << timer.elapsed_time() / 1000;
+    LOG(INFO) << "iter phase3 timer" << timer.elapsed_time() / 1000;
 
     _reader_context.push_down_agg_type_opt = read_params.push_down_agg_type_opt;
     std::vector<RowsetReaderSharedPtr> valid_rs_readers;
 
     for (int i = 0; i < read_params.rs_splits.size(); ++i) {
-        LOG(WARNING) << "---iter phase3 round " << i;
+        LOG(INFO) << "---iter phase3 round " << i;
         auto& rs_split = read_params.rs_splits[i];
 
-        LOG(WARNING) << "---iter phase3-1 timer" << timer.elapsed_time() / 1000;
+        LOG(INFO) << "---iter phase3-1 timer" << timer.elapsed_time() / 1000;
         // _vcollect_iter.topn_next() will init rs_reader by itself
         if (!_vcollect_iter.use_topn_next()) {
             RETURN_IF_ERROR(rs_split.rs_reader->init(&_reader_context, rs_split));
         }
 
-        LOG(WARNING) << "---iter phase3-2 timer" << timer.elapsed_time() / 1000;
+        LOG(INFO) << "---iter phase3-2 timer" << timer.elapsed_time() / 1000;
         Status res = _vcollect_iter.add_child(rs_split);
         if (!res.ok() && !res.is<END_OF_FILE>()) {
             LOG(WARNING) << "failed to add child to iterator, err=" << res;
@@ -152,9 +152,9 @@ Status BlockReader::_init_collect_iter(const ReaderParams& read_params) {
         if (res.ok()) {
             valid_rs_readers.push_back(rs_split.rs_reader);
         }
-        LOG(WARNING) << "---iter phase3-3 timer" << timer.elapsed_time() / 1000;
+        LOG(INFO) << "---iter phase3-3 timer" << timer.elapsed_time() / 1000;
     }
-    LOG(WARNING) << "iter phase4 timer" << timer.elapsed_time() / 1000;
+    LOG(INFO) << "iter phase4 timer" << timer.elapsed_time() / 1000;
 
     RETURN_IF_ERROR(_vcollect_iter.build_heap(valid_rs_readers));
     // _vcollect_iter.topn_next() can not use current_row
@@ -162,7 +162,7 @@ Status BlockReader::_init_collect_iter(const ReaderParams& read_params) {
         auto status = _vcollect_iter.current_row(&_next_row);
         _eof = status.is<END_OF_FILE>();
     }
-    LOG(WARNING) << "iter phase5 timer" << timer.elapsed_time() / 1000;
+    LOG(INFO) << "iter phase5 timer" << timer.elapsed_time() / 1000;
     timer.stop();
 
     return Status::OK();
@@ -207,7 +207,7 @@ void BlockReader::_init_agg_state(const ReaderParams& read_params) {
 }
 
 Status BlockReader::init(const ReaderParams& read_params) {
-    LOG(WARNING) << "start init reader";
+    LOG(INFO) << "start init reader";
     MonotonicStopWatch timer;
     timer.start();
     RETURN_IF_ERROR(TabletReader::init(read_params));
@@ -228,7 +228,7 @@ Status BlockReader::init(const ReaderParams& read_params) {
             }
         }
     }
-    LOG(WARNING) << "phase1 timer" << timer.elapsed_time() / 1000;
+    LOG(INFO) << "phase1 timer" << timer.elapsed_time() / 1000;
 
     auto status = _init_collect_iter(read_params);
     if (!status.ok()) {
@@ -238,7 +238,7 @@ Status BlockReader::init(const ReaderParams& read_params) {
     if (_direct_mode) {
         _next_block_func = &BlockReader::_direct_next_block;
         timer.stop();
-        LOG(WARNING) << "phase2 timer" << timer.elapsed_time() / 1000;
+        LOG(INFO) << "phase2 timer" << timer.elapsed_time() / 1000;
         return Status::OK();
     }
 

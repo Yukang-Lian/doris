@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <utility>
 
@@ -103,15 +104,17 @@ Status Segment::_open() {
 
 Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_options,
                              std::unique_ptr<RowwiseIterator>* iter) {
-    LOG(WARNING) << "----------------------------------start segment iterator";
+    LOG(INFO) << "----------------------------------start segment iterator";
     MonotonicStopWatch timer;
     timer.start();
+    auto t0 = timer.elapsed_time();
     read_options.stats->total_segment_number++;
     int32_t i = 0;
+    std::vector<uint64_t> t0vec(read_options.col_id_to_predicates.size());
     // trying to prune the current segment by segment-level zone map
     for (auto& entry : read_options.col_id_to_predicates) {
+        t0vec[i] = timer.elapsed_time();
         i++;
-        LOG(WARNING) << "-----3-1-1-1-1 timer1."<<i<<" " << timer.elapsed_time() / 1000;
         int32_t column_id = entry.first;
         // schema change
         if (_tablet_schema->num_columns() <= column_id) {
@@ -129,7 +132,7 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
             return Status::OK();
         }
     }
-    LOG(WARNING) << "-----3-1-1-1-1 timer1 " << timer.elapsed_time() / 1000;
+    auto t1 = timer.elapsed_time();
 
     if (read_options.use_topn_opt) {
         auto query_ctx = read_options.runtime_state->get_query_ctx();
@@ -148,7 +151,7 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
             }
         }
     }
-    LOG(WARNING) << "-----3-1-1-1-1 timer2 " << timer.elapsed_time() / 1000;
+    auto t2 = timer.elapsed_time();
 
     RETURN_IF_ERROR(load_index());
     if (read_options.delete_condition_predicates->num_of_column_predicate() == 0 &&
@@ -158,16 +161,23 @@ Status Segment::new_iterator(SchemaSPtr schema, const StorageReadOptions& read_o
     } else {
         iter->reset(new SegmentIterator(this->shared_from_this(), schema));
     }
-    auto t3 = timer.elapsed_time() / 1000;
-    LOG(WARNING) << "-----3-1-1-1-1 timer3 " << t3;
+    auto t3 = timer.elapsed_time();
 
     auto p = iter->get();
-    auto t4 = timer.elapsed_time() / 1000;
-    LOG(WARNING) << "-----3-1-1-1-1 timer4 " << t4;
+    auto t4 = timer.elapsed_time();
 
     Status s = p->init(read_options);
-    auto t5 = timer.elapsed_time() / 1000;
-    LOG(WARNING) << "-----3-1-1-1-1 timer5 " << t5;
+    auto t5 = timer.elapsed_time();
+
+    LOG(INFO) << "-----3-1-1-1-1 timer1 " << t0 / 1000;
+    for (auto i = 0; i < t0vec.size(); i++) {
+        LOG(INFO) << "-----3-1-1-1-1 timer0." << i << " " << t0vec[i] / 1000;
+    }
+    LOG(INFO) << "-----3-1-1-1-1 timer1 " << t1 / 1000;
+    LOG(INFO) << "-----3-1-1-1-1 timer2 " << t2 / 1000;
+    LOG(INFO) << "-----3-1-1-1-1 timer3 " << t3 / 1000;
+    LOG(INFO) << "-----3-1-1-1-1 timer4 " << t4 / 1000;
+    LOG(INFO) << "-----3-1-1-1-1 timer5 " << t5 / 1000;
     return s;
 }
 
