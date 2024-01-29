@@ -2432,7 +2432,8 @@ public class OlapTable extends Table {
     public void initAutoIncrementGenerator(long dbId) {
         for (Column column : fullSchema) {
             if (column.isAutoInc()) {
-                autoIncrementGenerator = new AutoIncrementGenerator(dbId, id, column.getUniqueId(),column.getAutoIncInitValue());
+                autoIncrementGenerator = new AutoIncrementGenerator(dbId, id, column.getUniqueId(),
+                        column.getAutoIncInitValue());
                 autoIncrementGenerator.setEditLog(Env.getCurrentEnv().getEditLog());
                 break;
             }

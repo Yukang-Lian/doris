@@ -529,7 +529,7 @@ public class HMSExternalTable extends ExternalTable {
             tmpSchema.add(new Column(field.getName().toLowerCase(Locale.ROOT),
                     HiveMetaStoreClientHelper.hiveTypeToDorisType(field.getType(),
                             IcebergExternalTable.ICEBERG_DATETIME_SCALE_MS),
-                    true, null, true, false, null, field.getComment(), true, null,
+                    true, null, true, -1, null, field.getComment(), true, null,
                     schema.caseInsensitiveFindField(field.getName()).fieldId(), null));
         }
         return tmpSchema;
