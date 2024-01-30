@@ -28,6 +28,7 @@ import org.apache.doris.analysis.CreateMaterializedViewStmt;
 import org.apache.doris.analysis.DropMaterializedViewStmt;
 import org.apache.doris.analysis.DropPartitionClause;
 import org.apache.doris.analysis.DropPartitionFromIndexClause;
+import org.apache.doris.analysis.ModifyAutoIncrementStartValueClause;
 import org.apache.doris.analysis.ModifyColumnCommentClause;
 import org.apache.doris.analysis.ModifyDistributionClause;
 import org.apache.doris.analysis.ModifyEngineClause;
@@ -66,6 +67,7 @@ import org.apache.doris.nereids.trees.plans.commands.info.TableNameInfo;
 import org.apache.doris.persist.AlterMTMV;
 import org.apache.doris.persist.AlterViewInfo;
 import org.apache.doris.persist.BatchModifyPartitionsInfo;
+import org.apache.doris.persist.ModifyAutoIncrementStartValueOperationLog;
 import org.apache.doris.persist.ModifyCommentOperationLog;
 import org.apache.doris.persist.ModifyPartitionInfo;
 import org.apache.doris.persist.ModifyTableEngineOperationLog;
@@ -263,6 +265,8 @@ public class Alter {
                     .modifyDefaultDistributionBucketNum(db, olapTable, (ModifyDistributionClause) alterClause);
         } else if (currentAlterOps.contains(AlterOpType.MODIFY_COLUMN_COMMENT)) {
             processModifyColumnComment(db, olapTable, alterClauses);
+        } else if (currentAlterOps.contains(AlterOpType.MODIFY_AUTO_INCREMENT_START_VALUE)) {
+            processModifyAutoIncrementStartValueClause(db, olapTable, alterClauses);
         } else if (currentAlterOps.contains(AlterOpType.MODIFY_TABLE_COMMENT)) {
             Preconditions.checkState(alterClauses.size() == 1);
             AlterClause alterClause = alterClauses.get(0);
@@ -342,6 +346,54 @@ public class Alter {
                 default:
                     break;
             }
+        } finally {
+            tbl.writeUnlock();
+        }
+    }
+
+    private void processModifyAutoIncrementStartValueClause(Database db, OlapTable tbl, List<AlterClause> alterClauses)
+            throws DdlException {
+        tbl.writeLockOrDdlException();
+        try {
+            // check first
+            Map<String, Long> colToComment = Maps.newHashMap();
+            for (AlterClause alterClause : alterClauses) {
+                Preconditions.checkState(alterClause instanceof ModifyAutoIncrementStartValueClause);
+                ModifyAutoIncrementStartValueClause clause = (ModifyAutoIncrementStartValueClause) alterClause;
+                String colName = clause.getColName();
+                if (tbl.getColumn(colName) == null) {
+                    throw new DdlException("Unknown column: " + colName);
+                }
+                if (colToComment.containsKey(colName)) {
+                    throw new DdlException("Duplicate column: " + colName);
+                }
+                colToComment.put(colName, clause.getAutoIncStartValue());
+            }
+
+            // modify auto increment start value
+            for (Map.Entry<String, Long> entry : colToComment.entrySet()) {
+                Column col = tbl.getColumn(entry.getKey());
+                col.setComment(entry.getValue());
+            }
+
+            // log
+            ModifyAutoIncrementStartValueOperationLog op = new ModifyAutoIncrementStartValueOperationLog(db.getId(),
+                    tbl.getId(), colToComment);
+            Env.getCurrentEnv().getEditLog().logModifyAutoIncrementStartValue(op);
+        } finally {
+            tbl.writeUnlock();
+        }
+    }
+
+    public void replayProcessModifyAutoIncrementStartValueClause(ModifyAutoIncrementStartValueOperationLog operation)
+            throws MetaNotFoundException {
+        long dbId = operation.getDbId();
+        long tblId = operation.getTblId();
+        Database db = Env.getCurrentInternalCatalog().getDbOrMetaException(dbId);
+        Table tbl = db.getTableOrMetaException(tblId);
+        tbl.writeLock();
+        try {
+            tbl.setComment(operation.getColToAutoIncStartValue());
         } finally {
             tbl.writeUnlock();
         }

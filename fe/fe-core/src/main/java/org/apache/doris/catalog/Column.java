@@ -1013,6 +1013,7 @@ public class Column implements Writable, GsonPostProcessable {
                 && isKey == other.isKey
                 && isAllowNull == other.isAllowNull
                 && isAutoInc == other.isAutoInc
+                && autoIncInitValue == other.autoIncInitValue
                 && getDataType().equals(other.getDataType())
                 && getStrLen() == other.getStrLen()
                 && getPrecision() == other.getPrecision()

@@ -91,6 +91,7 @@ import org.apache.doris.persist.DropWorkloadSchedPolicyOperatorLog;
 import org.apache.doris.persist.GlobalVarPersistInfo;
 import org.apache.doris.persist.HbPackage;
 import org.apache.doris.persist.LdapInfo;
+import org.apache.doris.persist.ModifyAutoIncrementStartValueOperationLog;
 import org.apache.doris.persist.ModifyCommentOperationLog;
 import org.apache.doris.persist.ModifyPartitionInfo;
 import org.apache.doris.persist.ModifyTableDefaultDistributionBucketNumOperationLog;
@@ -708,6 +709,11 @@ public class JournalEntity implements Writable {
             }
             case OperationType.OP_MODIFY_TABLE_ENGINE: {
                 data = ModifyTableEngineOperationLog.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_MODIFY_AUTO_INCREMENT_START_VALUE: {
+                data = ModifyAutoIncrementStartValueOperationLog.read(in);
                 isRead = true;
                 break;
             }

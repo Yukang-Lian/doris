@@ -1651,6 +1651,10 @@ alter_table_clause ::=
     {:
         RESULT = new ModifyColumnCommentClause(colName, comment);
     :}
+    | KW_MODIFY KW_COLUMN ident:colName KW_AUTO_INCREMENT LPAREN INTEGER_LITERAL:new_auto_inc_init_value PAREN
+    {:
+        RESULT = new ModifyAutoIncrementStartValueClause(colName, new_auto_inc_init_value.longValue());
+    :}
     | KW_MODIFY KW_ENGINE KW_TO ident:engine opt_properties:properties
     {:
         RESULT = new ModifyEngineClause(engine, properties);

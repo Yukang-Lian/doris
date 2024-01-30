@@ -890,6 +890,11 @@ public class EditLog {
                     env.getAlterInstance().replayProcessModifyEngine(log);
                     break;
                 }
+                case OperationType.OP_MODIFY_AUTO_INCREMENT_START_VALUE: {
+                    ModifyAutoIncrementStartValueOperationLog log = (ModifyAutoIncrementStartValueOperationLog) journal.getData();
+                    env.getAlterInstance().replayProcessModifyAutoIncrementStartValueClause(log);
+                    break;
+                }
                 case OperationType.OP_CREATE_POLICY: {
                     Policy log = (Policy) journal.getData();
                     env.getPolicyMgr().replayCreate(log);
@@ -1831,6 +1836,10 @@ public class EditLog {
 
     public void logModifyComment(ModifyCommentOperationLog op) {
         logEdit(OperationType.OP_MODIFY_COMMENT, op);
+    }
+
+    public void logModifyAutoIncrementStartValue(ModifyAutoIncrementStartValueOperationLog op) {
+        logEdit(OperationType.OP_MODIFY_AUTO_INCREMENT_START_VALUE, op);
     }
 
     public void logCreateSqlBlockRule(SqlBlockRule rule) {

@@ -41,6 +41,7 @@ public enum AlterOpType {
     MODIFY_DISTRIBUTION,
     MODIFY_TABLE_COMMENT,
     MODIFY_COLUMN_COMMENT,
+    MODIFY_AUTO_INCREMENT_START_VALUE,
     MODIFY_ENGINE,
     INVALID_OP; // INVALID_OP must be the last one
 
@@ -74,6 +75,6 @@ public enum AlterOpType {
     public boolean mtmvAllowOp() {
         return this == MODIFY_TABLE_PROPERTY || this == MODIFY_DISTRIBUTION || this == MODIFY_TABLE_COMMENT
                 || this == ADD_PARTITION || this == DROP_PARTITION || this == REPLACE_PARTITION
-                || this == MODIFY_PARTITION;
+                || this == MODIFY_PARTITION || this == MODIFY_AUTO_INCREMENT_START_VALUE;
     }
 }
