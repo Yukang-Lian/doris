@@ -857,6 +857,17 @@ message PGetWalQueueSizeResponse{
     optional int64 size = 2;
 }
 
+message PResetAutoIncrementStartValueRequest{
+    required int64 db_id = 1;
+    required int64 table_id = 2;
+    required int64 col_id = 3;
+    required int64 auto_increment_start_value = 4;
+}
+
+message PResetAutoIncrementStartValueResponse{
+    required PStatus status = 1;
+}
+
 message PTabletsLocation {
     required string host = 1;
     required int32  brpc_port = 2;
@@ -917,6 +928,7 @@ service PBackendService {
     rpc glob(PGlobRequest) returns (PGlobResponse);
     rpc group_commit_insert(PGroupCommitInsertRequest) returns (PGroupCommitInsertResponse);
     rpc get_wal_queue_size(PGetWalQueueSizeRequest) returns(PGetWalQueueSizeResponse);
+    rpc reset_auto_increment_start_value(PResetAutoIncrementStartValueRequest) returns(PResetAutoIncrementStartValueResponse);
     rpc fetch_arrow_flight_schema(PFetchArrowFlightSchemaRequest) returns (PFetchArrowFlightSchemaResult);
     rpc fetch_remote_tablet_schema(PFetchRemoteSchemaRequest) returns (PFetchRemoteSchemaResponse);
 };

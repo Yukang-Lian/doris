@@ -171,6 +171,10 @@ public class BackendServiceClient {
         return stub.getWalQueueSize(request);
     }
 
+    public Future<InternalService.PResetAutoIncrementStartValueResponse> resetAutoIncrementStartValue(
+            InternalService.PResetAutoIncrementStartValueRequest request) {
+        return stub.resetAutoIncrementStartValue(request);
+    }
 
     public void shutdown() {
         ConnectivityState state = channel.getState(false);

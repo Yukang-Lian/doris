@@ -62,8 +62,7 @@ public class ModifyAutoIncrementStartValueClause extends AlterTableClause {
     @Override
     public String toSql() {
         StringBuilder sb = new StringBuilder();
-        sb.append("MODIFY COLUMN COMMENT ").append(colName);
-        sb.append(" '").append(comment).append("'");
+        sb.append("MODIFY COLUMN ").append(colName).append(" AUTOINCREMENT(").append(autoIncStartValue).append(")");
         return sb.toString();
     }
 

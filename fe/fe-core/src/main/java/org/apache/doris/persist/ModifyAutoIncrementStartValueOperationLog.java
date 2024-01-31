@@ -26,7 +26,6 @@ import com.google.gson.annotations.SerializedName;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.util.Map;
 
 // Persist the info when removing batch of expired txns
 public class ModifyAutoIncrementStartValueOperationLog implements Writable {
@@ -35,14 +34,18 @@ public class ModifyAutoIncrementStartValueOperationLog implements Writable {
     private long dbId;
     @SerializedName(value = "tblId")
     private long tblId;
-    @SerializedName(value = "colToAutoIncStartValue")
-    private Map<String, Long> colToAutoIncStartValue;
+    @SerializedName(value = "colName")
+    private String colName;
+
+    @SerializedName(value = "autoIncstartValue")
+    private long autoIncStartValue;
 
     public ModifyAutoIncrementStartValueOperationLog(long dbId, long tblId,
-            Map<String, Long> colToAutoIncStartValue) {
+            String colName, long autoIncStartValue) {
         this.dbId = dbId;
         this.tblId = tblId;
-        this.colToAutoIncStartValue = colToAutoIncStartValue;
+        this.colName = colName;
+        this.autoIncStartValue = autoIncStartValue;
     }
 
     public long getDbId() {
@@ -53,8 +56,12 @@ public class ModifyAutoIncrementStartValueOperationLog implements Writable {
         return tblId;
     }
 
-    public Map<String, Long> getColToAutoIncStartValue() {
-        return colToAutoIncStartValue;
+    public String getColName() {
+        return colName;
+    }
+
+    public long getAutoIncStartValue() {
+        return autoIncStartValue;
     }
 
     @Override

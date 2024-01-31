@@ -27,6 +27,8 @@ import org.apache.doris.proto.InternalService.PGetWalQueueSizeRequest;
 import org.apache.doris.proto.InternalService.PGetWalQueueSizeResponse;
 import org.apache.doris.proto.InternalService.PGroupCommitInsertRequest;
 import org.apache.doris.proto.InternalService.PGroupCommitInsertResponse;
+import org.apache.doris.proto.InternalService.PResetAutoIncrementStartValueRequest;
+import org.apache.doris.proto.InternalService.PResetAutoIncrementStartValueResponse;
 import org.apache.doris.proto.Types;
 import org.apache.doris.thrift.TExecPlanFragmentParamsList;
 import org.apache.doris.thrift.TFoldConstantParams;
@@ -496,5 +498,16 @@ public class BackendServiceProxy {
         }
     }
 
+    public Future<PResetAutoIncrementStartValueResponse> resetAutoIncrementStartValue(TNetworkAddress address,
+            PResetAutoIncrementStartValueRequest request) throws RpcException {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.resetAutoIncrementStartValue(request);
+        } catch (Throwable e) {
+            LOG.warn("failed to reset auto increment start value from address={}:{}", address.getHostname(),
+                    address.getPort(), e);
+            throw new RpcException(address.hostname, e.getMessage());
+        }
+    }
 
 }

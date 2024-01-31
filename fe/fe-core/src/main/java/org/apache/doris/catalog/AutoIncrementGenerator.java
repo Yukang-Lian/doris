@@ -17,6 +17,7 @@
 
 package org.apache.doris.catalog;
 
+import org.apache.doris.common.DdlException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.io.Text;
@@ -92,6 +93,17 @@ public class AutoIncrementGenerator implements Writable {
         }
         LOG.info("[getAutoIncrementRange result][{}, {}]", startId, length);
         return Pair.of(startId, length);
+    }
+
+    public void modifyAutoIncrementStartValue(Database db, OlapTable table, Column column, long autoIncreStartValue)
+            throws DdlException {
+        LOG.info("[receive user modify auto increment start value request, new start value: {}, current max value: {}]",
+                autoIncreStartValue, nextId);
+        if (autoIncreStartValue > nextId) {
+            throw new DdlException("new auto increment start value must be greater than" + nextId);
+        }
+        //List<Long> aliveBeIds = Env.getCurrentSystemInfo().getAllBackendIds(true);
+
     }
 
     @Override

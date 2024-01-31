@@ -1145,6 +1145,10 @@ public class Column implements Writable, GsonPostProcessable {
         return this.autoIncInitValue;
     }
 
+    public void setAutoIncInitValue(long autoIncInitValue) {
+        this.autoIncInitValue = autoIncInitValue;
+    }
+
     public void setIndexFlag(TColumn tColumn, OlapTable olapTable) {
         List<Index> indexes = olapTable.getIndexes();
         for (Index index : indexes) {

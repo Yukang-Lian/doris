@@ -891,7 +891,8 @@ public class EditLog {
                     break;
                 }
                 case OperationType.OP_MODIFY_AUTO_INCREMENT_START_VALUE: {
-                    ModifyAutoIncrementStartValueOperationLog log = (ModifyAutoIncrementStartValueOperationLog) journal.getData();
+                    ModifyAutoIncrementStartValueOperationLog log
+                            = (ModifyAutoIncrementStartValueOperationLog) journal.getData();
                     env.getAlterInstance().replayProcessModifyAutoIncrementStartValueClause(log);
                     break;
                 }

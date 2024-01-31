@@ -356,29 +356,27 @@ public class Alter {
         tbl.writeLockOrDdlException();
         try {
             // check first
-            Map<String, Long> colToComment = Maps.newHashMap();
-            for (AlterClause alterClause : alterClauses) {
-                Preconditions.checkState(alterClause instanceof ModifyAutoIncrementStartValueClause);
-                ModifyAutoIncrementStartValueClause clause = (ModifyAutoIncrementStartValueClause) alterClause;
-                String colName = clause.getColName();
-                if (tbl.getColumn(colName) == null) {
-                    throw new DdlException("Unknown column: " + colName);
-                }
-                if (colToComment.containsKey(colName)) {
-                    throw new DdlException("Duplicate column: " + colName);
-                }
-                colToComment.put(colName, clause.getAutoIncStartValue());
+            if (alterClauses.size() != 1) {
+                throw new DdlException(
+                        "There should be only one auto increment column in a table, but this alter clause has"
+                                + alterClauses.size() + " columns.");
             }
-
-            // modify auto increment start value
-            for (Map.Entry<String, Long> entry : colToComment.entrySet()) {
-                Column col = tbl.getColumn(entry.getKey());
-                col.setComment(entry.getValue());
+            AlterClause alterClause = alterClauses.get(0);
+            Preconditions.checkState(alterClause instanceof ModifyAutoIncrementStartValueClause);
+            ModifyAutoIncrementStartValueClause clause = (ModifyAutoIncrementStartValueClause) alterClause;
+            String colName = clause.getColName();
+            if (tbl.getColumn(colName) == null) {
+                throw new DdlException("Unknown column: " + colName);
             }
+            if (!tbl.getColumn(colName).isAutoInc()) {
+                throw new DdlException("column: " + colName + " is not auto increment column.");
+            }
+            processModifyAutoIncrementStartValueInternal(db, tbl, tbl.getColumn(colName),
+                    clause.getAutoIncStartValue());
 
             // log
             ModifyAutoIncrementStartValueOperationLog op = new ModifyAutoIncrementStartValueOperationLog(db.getId(),
-                    tbl.getId(), colToComment);
+                    tbl.getId(), colName, clause.getAutoIncStartValue());
             Env.getCurrentEnv().getEditLog().logModifyAutoIncrementStartValue(op);
         } finally {
             tbl.writeUnlock();
@@ -386,17 +384,23 @@ public class Alter {
     }
 
     public void replayProcessModifyAutoIncrementStartValueClause(ModifyAutoIncrementStartValueOperationLog operation)
-            throws MetaNotFoundException {
+            throws MetaNotFoundException, DdlException {
         long dbId = operation.getDbId();
         long tblId = operation.getTblId();
         Database db = Env.getCurrentInternalCatalog().getDbOrMetaException(dbId);
         Table tbl = db.getTableOrMetaException(tblId);
         tbl.writeLock();
         try {
-            tbl.setComment(operation.getColToAutoIncStartValue());
+            processModifyAutoIncrementStartValueInternal(db, (OlapTable) tbl, tbl.getColumn(operation.getColName()),
+                    operation.getAutoIncStartValue());
         } finally {
             tbl.writeUnlock();
         }
+    }
+
+    private void processModifyAutoIncrementStartValueInternal(Database db, OlapTable table, Column column,
+            Long autoIncStartValue) throws DdlException {
+        table.getAutoIncrementGenerator().modifyAutoIncrementStartValue(db, table, column, autoIncStartValue);
     }
 
     private void processAlterExternalTable(AlterTableStmt stmt, Table externalTable, Database db) throws UserException {

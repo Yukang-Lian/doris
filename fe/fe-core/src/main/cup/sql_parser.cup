@@ -1651,7 +1651,7 @@ alter_table_clause ::=
     {:
         RESULT = new ModifyColumnCommentClause(colName, comment);
     :}
-    | KW_MODIFY KW_COLUMN ident:colName KW_AUTO_INCREMENT LPAREN INTEGER_LITERAL:new_auto_inc_init_value PAREN
+    | KW_MODIFY KW_COLUMN ident:colName KW_AUTO_INCREMENT LPAREN INTEGER_LITERAL:new_auto_inc_init_value RPAREN
     {:
         RESULT = new ModifyAutoIncrementStartValueClause(colName, new_auto_inc_init_value.longValue());
     :}
