@@ -38,6 +38,18 @@ namespace vectorized {
 bvar::Adder<int64_t> g_group_commit_load_rows("doris_group_commit_load_rows");
 bvar::Adder<int64_t> g_group_commit_load_bytes("doris_group_commit_load_bytes");
 
+bvar::LatencyRecorder g_group_commit_block_sink_add_block1(
+        "doris_group_commit_block_sink_add_block1");
+bvar::LatencyRecorder g_group_commit_block_sink_add_block2(
+        "doris_group_commit_block_sink_add_block2");
+bvar::LatencyRecorder g_group_commit_block_sink_add_block3(
+        "doris_group_commit_block_sink_add_block3");
+bvar::LatencyRecorder g_group_commit_block_sink_send1("doris_group_commit_block_sink_send1");
+bvar::LatencyRecorder g_group_commit_block_sink_send2("doris_group_commit_block_sink_send2");
+bvar::LatencyRecorder g_group_commit_block_sink_send3("doris_group_commit_block_sink_send3");
+bvar::LatencyRecorder g_group_commit_block_sink_send4("doris_group_commit_block_sink_send4");
+bvar::LatencyRecorder g_group_commit_block_sink_close("doris_group_commit_block_sink_close");
+
 GroupCommitBlockSink::GroupCommitBlockSink(ObjectPool* pool, const RowDescriptor& row_desc,
                                            const std::vector<TExpr>& texprs, Status* status)
         : DataSink(row_desc), _filter_bitmap(1024) {
@@ -102,6 +114,7 @@ Status GroupCommitBlockSink::open(RuntimeState* state) {
 }
 
 Status GroupCommitBlockSink::close(RuntimeState* state, Status close_status) {
+    auto start_time = std::chrono::steady_clock::now();
     RETURN_IF_ERROR(DataSink::close(state, close_status));
     RETURN_IF_ERROR(close_status);
     int64_t total_rows = state->num_rows_load_total();
@@ -134,10 +147,15 @@ Status GroupCommitBlockSink::close(RuntimeState* state, Status close_status) {
         }
         st = _load_block_queue->status;
     }
+    auto end_time = std::chrono::steady_clock::now();
+    auto duration =
+            std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    g_group_commit_block_sink_close << duration;
     return st;
 }
 
 Status GroupCommitBlockSink::send(RuntimeState* state, vectorized::Block* input_block, bool eos) {
+    auto time1 = std::chrono::steady_clock::now();
     SCOPED_CONSUME_MEM_TRACKER(_mem_tracker.get());
     Status status = Status::OK();
     auto rows = input_block->rows();
@@ -158,6 +176,9 @@ Status GroupCommitBlockSink::send(RuntimeState* state, vectorized::Block* input_
     bool has_filtered_rows = false;
     RETURN_IF_ERROR(_block_convertor->validate_and_convert_block(
             state, input_block, block, _output_vexpr_ctxs, rows, has_filtered_rows));
+    auto time2 = std::chrono::steady_clock::now();
+    g_group_commit_block_sink_send1
+            << std::chrono::duration_cast<std::chrono::microseconds>(time2 - time1).count();
     _has_filtered_rows = false;
     if (!_vpartition->is_auto_partition()) {
         //reuse vars for find_partition
@@ -176,6 +197,9 @@ Status GroupCommitBlockSink::send(RuntimeState* state, vectorized::Block* input_
             _has_filtered_rows = true;
         }
     }
+    auto time3 = std::chrono::steady_clock::now();
+    g_group_commit_block_sink_send2
+            << std::chrono::duration_cast<std::chrono::microseconds>(time3 - time2).count();
 
     if (_block_convertor->num_filtered_rows() > 0 || _has_filtered_rows) {
         auto cloneBlock = block->clone_without_columns();
@@ -191,12 +215,20 @@ Status GroupCommitBlockSink::send(RuntimeState* state, vectorized::Block* input_
         }
         block->swap(res_block.to_block());
     }
+    auto time4 = std::chrono::steady_clock::now();
+    g_group_commit_block_sink_send3
+            << std::chrono::duration_cast<std::chrono::microseconds>(time4 - time3).count();
     // add block into block queue
-    return _add_block(state, block);
+    auto st = _add_block(state, block);
+    auto time5 = std::chrono::steady_clock::now();
+    g_group_commit_block_sink_send4
+            << std::chrono::duration_cast<std::chrono::microseconds>(time5 - time4).count();
+    return st;
 }
 
 Status GroupCommitBlockSink::_add_block(RuntimeState* state,
                                         std::shared_ptr<vectorized::Block> block) {
+    auto time1 = std::chrono::steady_clock::now();
     if (block->rows() == 0) {
         return Status::OK();
     }
@@ -209,6 +241,9 @@ Status GroupCommitBlockSink::_add_block(RuntimeState* state,
         block->get_by_position(i).column = make_nullable(block->get_by_position(i).column);
         block->get_by_position(i).type = make_nullable(block->get_by_position(i).type);
     }
+    auto time2 = std::chrono::steady_clock::now();
+    g_group_commit_block_sink_add_block1
+            << std::chrono::duration_cast<std::chrono::microseconds>(time2 - time1).count();
     // add block to queue
     auto cur_mutable_block = vectorized::MutableBlock::create_unique(block->clone_empty());
     {
@@ -218,6 +253,9 @@ Status GroupCommitBlockSink::_add_block(RuntimeState* state,
         }
         RETURN_IF_ERROR(block->append_to_block_by_selector(cur_mutable_block.get(), selector));
     }
+    auto time3 = std::chrono::steady_clock::now();
+    g_group_commit_block_sink_add_block2
+            << std::chrono::duration_cast<std::chrono::microseconds>(time3 - time2).count();
     std::shared_ptr<vectorized::Block> output_block = vectorized::Block::create_shared();
     output_block->swap(cur_mutable_block->to_block());
     if (!_is_block_appended && state->num_rows_load_total() + state->num_rows_load_unselected() +
@@ -231,6 +269,9 @@ Status GroupCommitBlockSink::_add_block(RuntimeState* state,
         RETURN_IF_ERROR(_load_block_queue->add_block(
                 state, output_block, _group_commit_mode == TGroupCommitMode::ASYNC_MODE));
     }
+    auto time4 = std::chrono::steady_clock::now();
+    g_group_commit_block_sink_add_block3
+            << std::chrono::duration_cast<std::chrono::microseconds>(time4 - time3).count();
     return Status::OK();
 }
 

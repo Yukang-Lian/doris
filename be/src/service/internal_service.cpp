@@ -144,6 +144,10 @@ namespace doris {
 using namespace ErrorCode;
 
 const uint32_t DOWNLOAD_FILE_MAX_RETRY = 3;
+bvar::LatencyRecorder g_group_commit_insert_try_offer1("doris_group_commit_insert_try_offer1");
+bvar::LatencyRecorder g_group_commit_insert_try_offer2("doris_group_commit_insert_try_offer2");
+bvar::LatencyRecorder g_group_commit_exec_plan1("doris_group_commit_exec_plan1");
+bvar::LatencyRecorder g_group_commit_exec_plan2("doris_group_commit_exec_plan2");
 
 DEFINE_GAUGE_METRIC_PROTOTYPE_2ARG(heavy_work_pool_queue_size, MetricUnit::NOUNIT);
 DEFINE_GAUGE_METRIC_PROTOTYPE_2ARG(light_work_pool_queue_size, MetricUnit::NOUNIT);
@@ -508,12 +512,16 @@ Status PInternalServiceImpl::_exec_plan_fragment_impl(
             return _exec_env->fragment_mgr()->exec_plan_fragment(t_request);
         }
     } else if (version == PFragmentRequestVersion::VERSION_2) {
+        auto time1 = std::chrono::steady_clock::now();
         TExecPlanFragmentParamsList t_request;
         {
             const uint8_t* buf = (const uint8_t*)ser_request.data();
             uint32_t len = ser_request.size();
             RETURN_IF_ERROR(deserialize_thrift_msg(buf, &len, compact, &t_request));
         }
+        auto time2 = std::chrono::steady_clock::now();
+        g_group_commit_exec_plan1
+                << std::chrono::duration_cast<std::chrono::microseconds>(time2 - time1).count();
         const auto& fragment_list = t_request.paramsList;
         MonotonicStopWatch timer;
         timer.start();
@@ -525,6 +533,9 @@ Status PInternalServiceImpl::_exec_plan_fragment_impl(
                 RETURN_IF_ERROR(_exec_env->fragment_mgr()->exec_plan_fragment(params));
             }
         }
+        auto time3 = std::chrono::steady_clock::now();
+        g_group_commit_exec_plan2
+                << std::chrono::duration_cast<std::chrono::microseconds>(time3 - time2).count();
 
         timer.stop();
         double cost_secs = static_cast<double>(timer.elapsed_time()) / 1000000000ULL;
@@ -533,7 +544,6 @@ Status PInternalServiceImpl::_exec_plan_fragment_impl(
                         fragment_list.size(), print_id(fragment_list.front().params.query_id),
                         cost_secs);
         }
-
         return Status::OK();
     } else if (version == PFragmentRequestVersion::VERSION_3) {
         TPipelineFragmentParamsList t_request;
@@ -2208,6 +2218,8 @@ void PInternalServiceImpl::group_commit_insert(google::protobuf::RpcController* 
     TUniqueId load_id;
     load_id.__set_hi(request->load_id().hi());
     load_id.__set_lo(request->load_id().lo());
+
+    auto time1 = std::chrono::steady_clock::now();
     bool ret = _light_work_pool.try_offer([this, request, response, done, load_id]() {
         brpc::ClosureGuard closure_guard(done);
         std::shared_ptr<StreamLoadContext> ctx = std::make_shared<StreamLoadContext>(_exec_env);
@@ -2255,11 +2267,17 @@ void PInternalServiceImpl::group_commit_insert(google::protobuf::RpcController* 
             }
         }
     });
+    auto time2 = std::chrono::steady_clock::now();
+    g_group_commit_insert_try_offer1
+            << std::chrono::duration_cast<std::chrono::microseconds>(time2 - time1).count();
     if (!ret) {
         _exec_env->new_load_stream_mgr()->remove(load_id);
         offer_failed(response, done, _light_work_pool);
         return;
     }
+    auto time3 = std::chrono::steady_clock::now();
+    g_group_commit_insert_try_offer2
+            << std::chrono::duration_cast<std::chrono::microseconds>(time3 - time2).count();
 };
 
 void PInternalServiceImpl::get_wal_queue_size(google::protobuf::RpcController* controller,

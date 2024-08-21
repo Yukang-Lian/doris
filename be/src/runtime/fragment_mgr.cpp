@@ -100,6 +100,11 @@ DEFINE_GAUGE_METRIC_PROTOTYPE_2ARG(timeout_canceled_fragment_count, MetricUnit::
 DEFINE_GAUGE_METRIC_PROTOTYPE_2ARG(fragment_thread_pool_queue_size, MetricUnit::NOUNIT);
 bvar::LatencyRecorder g_fragmentmgr_prepare_latency("doris_FragmentMgr", "prepare");
 bvar::Adder<int64_t> g_pipeline_fragment_instances_count("doris_pipeline_fragment_instances_count");
+bvar::LatencyRecorder g_group_commit_fragment_mgr1("doris_group_commit_fragment_mgr1");
+bvar::LatencyRecorder g_group_commit_fragment_mgr2("doris_group_commit_fragment_mgr2");
+bvar::LatencyRecorder g_group_commit_fragment_mgr3("doris_group_commit_fragment_mgr3");
+bvar::LatencyRecorder g_group_commit_fragment_mgr4("doris_group_commit_fragment_mgr4");
+bvar::LatencyRecorder g_group_commit_fragment_mgr5("doris_group_commit_fragment_mgr5");
 
 std::string to_load_error_http_path(const std::string& file_name) {
     if (file_name.empty()) {
@@ -711,6 +716,7 @@ Status FragmentMgr::_get_query_ctx(const Params& params, TUniqueId query_id, boo
 
 Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params,
                                        const FinishCallback& cb) {
+    auto time1 = std::chrono::steady_clock::now();
     VLOG_ROW << "exec_plan_fragment params is "
              << apache::thrift::ThriftDebugString(params).c_str();
     // sometimes TExecPlanFragmentParams debug string is too long and glog
@@ -719,14 +725,16 @@ Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params,
              << apache::thrift::ThriftDebugString(params.query_options).c_str();
     const TUniqueId& fragment_instance_id = params.params.fragment_instance_id;
     {
-        std::lock_guard<std::mutex> lock(_lock);
-        auto iter = _fragment_instance_map.find(fragment_instance_id);
-        if (iter != _fragment_instance_map.end()) {
+        auto value = _fragment_instance_map.find(fragment_instance_id);
+        if (value != nullptr) {
             // Duplicated
             LOG(WARNING) << "duplicate fragment instance id: " << print_id(fragment_instance_id);
             return Status::OK();
         }
     }
+    auto time2 = std::chrono::steady_clock::now();
+    g_group_commit_fragment_mgr1
+            << std::chrono::duration_cast<std::chrono::microseconds>(time2 - time1).count();
 
     std::shared_ptr<QueryContext> query_ctx;
     bool pipeline_engine_enabled = params.query_options.__isset.enable_pipeline_engine &&
@@ -742,6 +750,9 @@ Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params,
         std::lock_guard<std::mutex> lock(_lock);
         query_ctx->fragment_instance_ids.push_back(fragment_instance_id);
     }
+    auto time3 = std::chrono::steady_clock::now();
+    g_group_commit_fragment_mgr2
+            << std::chrono::duration_cast<std::chrono::microseconds>(time3 - time2).count();
 
     auto fragment_executor = std::make_shared<PlanFragmentExecutor>(
             _exec_env, query_ctx, params.params.fragment_instance_id, -1, params.backend_num,
@@ -759,6 +770,9 @@ Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params,
         SCOPED_RAW_TIMER(&duration_ns);
         RETURN_IF_ERROR(fragment_executor->prepare(params));
     }
+    auto time4 = std::chrono::steady_clock::now();
+    g_group_commit_fragment_mgr3
+            << std::chrono::duration_cast<std::chrono::microseconds>(time4 - time3).count();
     g_fragmentmgr_prepare_latency << (duration_ns / 1000);
     std::shared_ptr<RuntimeFilterMergeControllerEntity> handler;
     // TODO need check the status, but when I add return_if_error the P0 will not pass
@@ -766,13 +780,14 @@ Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params,
             params.params, params.params.query_id, params.query_options, &handler,
             RuntimeFilterParamsContext::create(fragment_executor->runtime_state())));
     {
-        std::lock_guard<std::mutex> lock(_lock);
         if (handler) {
             query_ctx->set_merge_controller_handler(handler);
         }
-        _fragment_instance_map.insert(
-                std::make_pair(params.params.fragment_instance_id, fragment_executor));
+        _fragment_instance_map.insert(params.params.fragment_instance_id, fragment_executor);
     }
+    auto time5 = std::chrono::steady_clock::now();
+    g_group_commit_fragment_mgr4
+            << std::chrono::duration_cast<std::chrono::microseconds>(time5 - time4).count();
 
     auto st = _thread_pool->submit_func([this, fragment_executor, cb]() {
 #ifndef BE_TEST
@@ -783,7 +798,6 @@ Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params,
     if (!st.ok()) {
         {
             // Remove the exec state added
-            std::lock_guard<std::mutex> lock(_lock);
             _fragment_instance_map.erase(params.params.fragment_instance_id);
         }
         fragment_executor->cancel(PPlanFragmentCancelReason::INTERNAL_ERROR,
@@ -793,6 +807,9 @@ Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params,
                                     print_id(params.params.fragment_instance_id), st.to_string(),
                                     BackendOptions::get_localhost()));
     }
+    auto time6 = std::chrono::steady_clock::now();
+    g_group_commit_fragment_mgr5
+            << std::chrono::duration_cast<std::chrono::microseconds>(time6 - time5).count();
 
     return Status::OK();
 }
@@ -1085,9 +1102,9 @@ void FragmentMgr::cancel_instance(const TUniqueId& instance_id,
                 return;
             }
         } else {
-            auto itr = _fragment_instance_map.find(instance_id);
-            if (itr != _fragment_instance_map.end()) {
-                non_pipeline_ctx = itr->second;
+            auto value = _fragment_instance_map.find(instance_id);
+            if (value != nullptr) {
+                non_pipeline_ctx = value;
             } else {
                 LOG(WARNING) << "Could not find the fragment instance id:" << print_id(instance_id)
                              << " to cancel";
@@ -1129,9 +1146,9 @@ void FragmentMgr::cancel_worker() {
         VecDateTimeValue now = VecDateTimeValue::local_time();
         {
             std::lock_guard<std::mutex> lock(_lock);
-            for (auto& fragment_instance_itr : _fragment_instance_map) {
-                if (fragment_instance_itr.second->is_timeout(now)) {
-                    to_cancel.push_back(fragment_instance_itr.second->fragment_instance_id());
+            for (auto& fragment_instance : _fragment_instance_map.values()) {
+                if (fragment_instance->is_timeout(now)) {
+                    to_cancel.push_back(fragment_instance->fragment_instance_id());
                 }
             }
             for (auto& pipeline_itr : _pipeline_map) {
@@ -1253,11 +1270,6 @@ void FragmentMgr::debug(std::stringstream& ss) {
 
     ss << "FragmentMgr have " << _fragment_instance_map.size() << " jobs.\n";
     ss << "job_id\t\tstart_time\t\texecute_time(s)\n";
-    VecDateTimeValue now = VecDateTimeValue::local_time();
-    for (auto& it : _fragment_instance_map) {
-        ss << it.first << "\t" << it.second->start_time().debug_string() << "\t"
-           << now.second_diff(it.second->start_time()) << "\n";
-    }
 }
 
 /*
@@ -1405,12 +1417,12 @@ Status FragmentMgr::apply_filter(const PPublishFilterRequest* request,
                                 pip_context->get_query_ctx()->query_mem_tracker};
     } else {
         std::unique_lock<std::mutex> lock(_lock);
-        auto iter = _fragment_instance_map.find(tfragment_instance_id);
-        if (iter == _fragment_instance_map.end()) {
+        auto value = _fragment_instance_map.find(tfragment_instance_id);
+        if (value != nullptr) {
             VLOG_CRITICAL << "unknown.... fragment instance id:" << print_id(tfragment_instance_id);
             return Status::InvalidArgument("fragment-id: {}", print_id(tfragment_instance_id));
         }
-        fragment_executor = iter->second;
+        fragment_executor = value;
 
         DCHECK(fragment_executor != nullptr);
         runtime_filter_mgr =
@@ -1454,11 +1466,11 @@ Status FragmentMgr::apply_filterv2(const PPublishFilterRequestV2* request,
                 query_thread_context = {pip_context->get_query_ctx()->query_id(),
                                         pip_context->get_query_ctx()->query_mem_tracker};
             } else {
-                auto iter = _fragment_instance_map.find(tfragment_instance_id);
-                if (iter == _fragment_instance_map.end()) {
+                auto value = _fragment_instance_map.find(tfragment_instance_id);
+                if (value == nullptr) {
                     continue;
                 }
-                fragment_executor = iter->second;
+                fragment_executor = value;
 
                 DCHECK(fragment_executor != nullptr);
                 runtime_filter_mgr = fragment_executor->get_query_ctx()->runtime_filter_mgr();
