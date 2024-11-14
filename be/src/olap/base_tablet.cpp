@@ -1592,33 +1592,65 @@ std::vector<RowsetSharedPtr> BaseTablet::get_snapshot_rowset(bool include_stale_
 void BaseTablet::calc_consecutive_empty_rowsets(
         std::vector<RowsetSharedPtr>* empty_rowsets,
         const std::vector<RowsetSharedPtr>& candidate_rowsets, int limit) {
+    LOG_WARNING("[time lyk_debug]: ")
+            .tag("tablet_id", tablet_id())
+            .tag("candidate_rowsets", candidate_rowsets.front()->version().to_string())
+            .tag("candidate_rowsets", candidate_rowsets.size());
     int len = candidate_rowsets.size();
     for (int i = 0; i < len - 1; ++i) {
         auto rowset = candidate_rowsets[i];
         auto next_rowset = candidate_rowsets[i + 1];
+        LOG_WARNING("[time lyk_debug]: ")
+                .tag("tablet_id", tablet_id())
+                .tag("i", i)
+                .tag("rowset", rowset->version().to_string())
+                .tag("rowset->num_segments()", rowset->num_segments())
+                .tag("rowset->rowset_meta()->has_delete_predicate()",
+                     rowset->rowset_meta()->has_delete_predicate())
+                .tag("next_rowset", next_rowset->version().to_string())
+                .tag("next_rowset->num_segments()", next_rowset->num_segments())
+                .tag("next_rowset->rowset_meta()->has_delete_predicate()",
+                     next_rowset->rowset_meta()->has_delete_predicate());
 
         // identify two consecutive rowsets that are empty
         if (rowset->num_segments() == 0 && next_rowset->num_segments() == 0 &&
             !rowset->rowset_meta()->has_delete_predicate() &&
             !next_rowset->rowset_meta()->has_delete_predicate() &&
             rowset->end_version() == next_rowset->start_version() - 1) {
+            LOG_WARNING("[time lyk_debug]: 1").tag("tablet_id", tablet_id());
             empty_rowsets->emplace_back(rowset);
             empty_rowsets->emplace_back(next_rowset);
             rowset = next_rowset;
             int next_index = i + 2;
 
+            LOG_WARNING("[time lyk_debug]: 2")
+                    .tag("tablet_id", tablet_id())
+                    .tag("i", i)
+                    .tag("next_index", next_index);
             // keep searching for consecutive empty rowsets
             while (next_index < len && candidate_rowsets[next_index]->num_segments() == 0 &&
                    !candidate_rowsets[next_index]->rowset_meta()->has_delete_predicate() &&
                    rowset->end_version() == candidate_rowsets[next_index]->start_version() - 1) {
                 empty_rowsets->emplace_back(candidate_rowsets[next_index]);
+                LOG_WARNING("[time lyk_debug]: 3")
+                        .tag("candidate_rowsets[next_index]",
+                             candidate_rowsets[next_index]->version().to_string())
+                        .tag("tablet_id", tablet_id());
                 rowset = candidate_rowsets[next_index++];
             }
+            LOG_WARNING("[time lyk_debug]: 4")
+                    .tag("empty_rowsets->size()", empty_rowsets->size())
+                    .tag("limit", limit)
+                    .tag("len", len)
+                    .tag("next_index", next_index)
+                    .tag("tablet_id", tablet_id());
             // if the number of consecutive empty rowset reach the limit,
             // and there are still rowsets following them
             if (empty_rowsets->size() >= limit && next_index < len) {
+                LOG_WARNING("[time lyk_debug]: 5").tag("tablet_id", tablet_id());
                 return;
             } else {
+                LOG_WARNING("[time lyk_debug]: 6").tag("tablet_id", tablet_id());
                 // current rowset is not empty, start searching from that rowset in the next
                 i = next_index - 1;
                 empty_rowsets->clear();

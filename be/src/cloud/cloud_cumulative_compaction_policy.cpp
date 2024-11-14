@@ -324,6 +324,7 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
             .tag("allow delete", allow_delete);
     if (tablet->tablet_state() == TABLET_NOTREADY) {
         LOG_WARNING("[time lyk_debug]: Tablet state is not ready, skipping compaction")
+                .tag("tablet id", tablet->tablet_id())
                 .tag("tablet_state", tablet->tablet_state());
         return 0;
     }
@@ -339,25 +340,35 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
     for (const auto& rowset : candidate_rowsets) {
         LOG_WARNING("[time lyk_debug]: Processing rowset")
                 .tag("rowset_id", rowset->rowset_id())
+                .tag("tablet id", tablet->tablet_id())
                 .tag("has_delete_predicate", rowset->rowset_meta()->has_delete_predicate());
 
         // check whether this rowset is delete version
+        LOG_WARNING("[time lyk_debug]: ")
+                .tag("tablet id", tablet->tablet_id())
+                .tag("allow_delete", allow_delete)
+                .tag("has_delete_predicate", rowset->rowset_meta()->has_delete_predicate());
         if (!allow_delete && rowset->rowset_meta()->has_delete_predicate()) {
             *last_delete_version = rowset->version();
             LOG_WARNING("[time lyk_debug]: Rowset has delete predicate, processing delete version")
+                    .tag("tablet id", tablet->tablet_id())
                     .tag("last_delete_version", last_delete_version->to_string());
             if (!input_rowsets->empty()) {
                 LOG_WARNING(
-                        "[time lyk_debug]: Found delete version, and there were other versions before. "
-                        "Break compaction.");
+                        "[time lyk_debug]: Found delete version, and there were other versions "
+                        "before. "
+                        "Break compaction.")
+                        .tag("tablet id", tablet->tablet_id());
                 // we meet a delete version, and there were other versions before.
                 // we should compact those version before handling them over to base compaction
                 break;
             } else {
                 // we meet a delete version, and no other versions before, skip it and continue
                 LOG_WARNING(
-                        "[time lyk_debug]: Found delete version, but no previous versions, skipping it "
-                        "and clearing rowsets");
+                        "[time lyk_debug]: Found delete version, but no previous versions, "
+                        "skipping it "
+                        "and clearing rowsets")
+                        .tag("tablet id", tablet->tablet_id());
                 input_rowsets->clear();
                 *compaction_score = 0;
                 transient_size = 0;
@@ -372,6 +383,7 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
         transient_size += 1;
         input_rowsets->push_back(rowset);
         LOG_WARNING("[time lyk_debug]: Updated compaction score and total size")
+                .tag("tablet id", tablet->tablet_id())
                 .tag("compaction_score", *compaction_score)
                 .tag("total_size", total_size)
                 .tag("transient_size", transient_size);
@@ -379,11 +391,14 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
         // Condition 1: the size of input files for compaction meets the requirement of parameter compaction_goal_size
         if (total_size >= (compaction_goal_size_mbytes * 1024 * 1024)) {
             LOG_WARNING("[time lyk_debug]: Compaction goal size met, checking rowset overlap")
+                    .tag("tablet id", tablet->tablet_id())
                     .tag("compaction_goal_size_mbytes", compaction_goal_size_mbytes)
                     .tag("total_size", total_size);
             if (input_rowsets->size() == 1 &&
                 !input_rowsets->front()->rowset_meta()->is_segments_overlapping()) {
-                LOG_WARNING("[time lyk_debug]: Only one non-overlapping rowset, skipping compaction")
+                LOG_WARNING(
+                        "[time lyk_debug]: Only one non-overlapping rowset, skipping compaction")
+                        .tag("tablet id", tablet->tablet_id())
                         .tag("rowset_id", input_rowsets->front()->rowset_id());
                 // Only 1 non-overlapping rowset, skip it
                 input_rowsets->clear();
@@ -398,6 +413,7 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
             LOG_WARNING(
                     "[time lyk_debug]: Compaction score exceeds max rowset count, terminating "
                     "compaction")
+                    .tag("tablet id", tablet->tablet_id())
                     .tag("compaction_score", *compaction_score)
                     .tag("compaction_max_rowset_count", config::compaction_max_rowset_count);
             return transient_size;
@@ -405,8 +421,12 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
     }
 
     // if there is delete version, do compaction directly
+    LOG_WARNING("[time lyk_debug]: ")
+            .tag("tablet id", tablet->tablet_id())
+            .tag("last_delete_version->first", last_delete_version->first);
     if (last_delete_version->first != -1) {
         LOG_WARNING("[time lyk_debug]: Last delete version found, checking rowset compaction logic")
+                .tag("tablet id", tablet->tablet_id())
                 .tag("last_delete_version", last_delete_version->to_string());
 
         // if there is only one rowset and not overlapping,
@@ -416,6 +436,7 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
             LOG_WARNING(
                     "[time lyk_debug]: Only one rowset and segments are not overlapping, clearing "
                     "rowsets")
+                    .tag("tablet id", tablet->tablet_id())
                     .tag("input_rowsets_size", input_rowsets->size())
                     .tag("is_segments_overlapping",
                          input_rowsets->front()->rowset_meta()->is_segments_overlapping());
@@ -426,22 +447,35 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
     }
     LOG_WARNING("[time lyk_debug]: Checking compaction score against file count threshold")
             .tag("compaction_score", *compaction_score)
+            .tag("tablet id", tablet->tablet_id())
             .tag("compaction_file_count_threshold",
                  tablet->tablet_meta()->time_series_compaction_file_count_threshold());
 
     // Condition 2: the number of input files reaches the threshold specified by parameter compaction_file_count_threshold
+    LOG_WARNING("[time lyk_debug]: ")
+            .tag("tablet id", tablet->tablet_id())
+            .tag("compaction_score", *compaction_score)
+            .tag("tablet->tablet_meta()->time_series_compaction_file_count_threshold()",
+                 tablet->tablet_meta()->time_series_compaction_file_count_threshold());
     if (*compaction_score >= tablet->tablet_meta()->time_series_compaction_file_count_threshold()) {
         LOG_WARNING(
-                "[time lyk_debug]: Compaction score exceeds or meets file count threshold, skipping "
+                "[time lyk_debug]: Compaction score exceeds or meets file count threshold, "
+                "skipping "
                 "compaction")
+                .tag("tablet id", tablet->tablet_id())
                 .tag("compaction_score", *compaction_score);
         return transient_size;
     }
 
     // Condition 3: level1 achieve compaction_goal_size
     std::vector<RowsetSharedPtr> level1_rowsets;
+    LOG_WARNING("[time lyk_debug]: ")
+            .tag("tablet id", tablet->tablet_id())
+            .tag("tablet->tablet_meta()->time_series_compaction_level_threshold()",
+                 tablet->tablet_meta()->time_series_compaction_level_threshold());
     if (tablet->tablet_meta()->time_series_compaction_level_threshold() >= 2) {
         LOG_WARNING("[time lyk_debug]: Checking if level 1 rowsets can meet compaction goal size")
+                .tag("tablet id", tablet->tablet_id())
                 .tag("level_threshold",
                      tablet->tablet_meta()->time_series_compaction_level_threshold())
                 .tag("compaction_goal_size_mbytes", compaction_goal_size_mbytes);
@@ -450,6 +484,7 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
             const auto& rs_meta = rowset->rowset_meta();
             if (rs_meta->compaction_level() == 0) {
                 LOG_WARNING("[time lyk_debug]: Encountered level 0 rowset, breaking out of loop")
+                        .tag("tablet id", tablet->tablet_id())
                         .tag("rowset_id", rowset->rowset_id())
                         .tag("compaction_level", rs_meta->compaction_level());
                 break;
@@ -457,12 +492,15 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
             level1_rowsets.push_back(rowset);
             continuous_size += rs_meta->total_disk_size();
             LOG_WARNING("[time lyk_debug]: Adding rowset to level1 rowsets")
+                    .tag("tablet id", tablet->tablet_id())
                     .tag("rowset_id", rowset->rowset_id())
                     .tag("continuous_size", continuous_size);
             if (level1_rowsets.size() >= 2) {
                 if (continuous_size >= compaction_goal_size_mbytes * 1024 * 1024) {
                     LOG_WARNING(
-                            "[time lyk_debug]: Achieved compaction goal size, swapping level1 rowsets")
+                            "[time lyk_debug]: Achieved compaction goal size, swapping level1 "
+                            "rowsets")
+                            .tag("tablet id", tablet->tablet_id())
                             .tag("continuous_size", continuous_size)
                             .tag("compaction_goal_size", compaction_goal_size_mbytes * 1024 * 1024);
                     input_rowsets->swap(level1_rowsets);
@@ -474,11 +512,16 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
 
     int64_t now = UnixMillis();
     int64_t last_cumu = tablet->last_cumu_compaction_success_time();
+    LOG_WARNING("[time lyk_debug]: ")
+            .tag("tablet id", tablet->tablet_id())
+            .tag("now", now)
+            .tag("last_cumu", last_cumu);
     if (last_cumu != 0) {
         int64_t cumu_interval = now - last_cumu;
 
         // Condition 4: the time interval between compactions exceeds the value specified by parameter compaction_time_threshold_second
         LOG_WARNING("[time lyk_debug]: Checking compaction time interval")
+                .tag("tablet id", tablet->tablet_id())
                 .tag("last_cumu", last_cumu)
                 .tag("current_time", now)
                 .tag("cumu_interval", cumu_interval)
@@ -487,14 +530,17 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
         if (cumu_interval >
             (tablet->tablet_meta()->time_series_compaction_time_threshold_seconds() * 1000)) {
             LOG_WARNING(
-                    "[time lyk_debug]: Compaction time interval exceeded, checking level threshold and "
+                    "[time lyk_debug]: Compaction time interval exceeded, checking level threshold "
+                    "and "
                     "rowsets")
+                    .tag("tablet id", tablet->tablet_id())
                     .tag("compaction_time_interval", cumu_interval);
             if (tablet->tablet_meta()->time_series_compaction_level_threshold() >= 2) {
                 if (input_rowsets->empty() && level1_rowsets.size() >= 2) {
                     LOG_WARNING(
                             "[time lyk_debug]: Time threshold exceeded and enough level1 rowsets, "
                             "swapping")
+                            .tag("tablet id", tablet->tablet_id())
                             .tag("level1_rowsets_size", level1_rowsets.size());
                     input_rowsets->swap(level1_rowsets);
                     return input_rowsets->size();
@@ -506,9 +552,18 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
 
     input_rowsets->clear();
     // Condition 5: If their are many empty rowsets, maybe should be compacted
+    LOG_WARNING("[time lyk_debug]: ")
+            .tag("tablet id", tablet->tablet_id())
+            .tag("tablet->tablet_meta()->time_series_compaction_empty_rowsets_threshold()",
+                 tablet->tablet_meta()->time_series_compaction_empty_rowsets_threshold())
+            .tag("candidate_rowsets", candidate_rowsets.size())
+            .tag("input_rowsets", input_rowsets->size());
     tablet->calc_consecutive_empty_rowsets(
             input_rowsets, candidate_rowsets,
             tablet->tablet_meta()->time_series_compaction_empty_rowsets_threshold());
+    LOG_WARNING("[time lyk_debug]: ")
+            .tag("tablet id", tablet->tablet_id())
+            .tag("input_rowsets", input_rowsets->size());
     if (!input_rowsets->empty()) {
         LOG_WARNING("[time lyk_debug]: Too many consecutive empty rowsets detected")
                 .tag("tablet_id", tablet->tablet_id())
@@ -519,7 +574,8 @@ int32_t CloudTimeSeriesCumulativeCompactionPolicy::pick_input_rowsets(
         return 0;
     }
     LOG_WARNING("[time lyk_debug]: Reset compaction score after empty rowsets check")
-            .tag("compaction_score", *compaction_score);
+            .tag("compaction_score", *compaction_score)
+            .tag("tablet id", tablet->tablet_id());
     *compaction_score = 0;
 
     return 0;
