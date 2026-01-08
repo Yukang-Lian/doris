@@ -33,6 +33,7 @@
 #include "olap/rowset/rowset_reader.h"
 #include "olap/rowset/rowset_reader_context.h"
 #include "olap/tablet_schema.h"
+#include "util/simd/bits.h"
 #include "vec/aggregate_functions/aggregate_function_reader.h"
 #include "vec/columns/column_nullable.h"
 #include "vec/columns/column_vector.h"
@@ -537,9 +538,117 @@ Status VerticalBlockReader::_unique_key_next_block(Block* block, bool* eof) {
         _eof = *eof;
         return Status::OK();
     }
-    int target_block_row = 0;
+
+    // Value column processing - use batch optimization if enabled
     auto target_columns = block->mutate_columns();
-    size_t column_count = block->columns();
+    const size_t column_count = block->columns();
+
+    // Try to use batch optimization for sparse column compaction
+    if (config::enable_sparse_column_compaction_optimization) {
+        auto* mask_iter = dynamic_cast<VerticalMaskMergeIterator*>(_vcollect_iter.get());
+        if (mask_iter != nullptr) {
+            // Step 1: Batch fetch row information
+            std::vector<RowBatch> batches;
+            size_t actual_rows = 0;
+
+            RETURN_IF_ERROR(mask_iter->unique_key_next_batch(&batches, _reader_context.batch_size,
+                                                             &actual_rows));
+
+            if (actual_rows == 0) {
+                *eof = true;
+                _eof = true;
+                return Status::OK();
+            }
+
+            const size_t base_offset =
+                    target_columns.empty() ? 0 : target_columns[0]->size();
+
+            // Step 2: Sparse optimization - pre-fill with NULL and pre-cast destination columns
+            // Pre-cast destination columns outside the loop to avoid repeated assert_cast
+            std::vector<ColumnNullable*> nullable_dst_cols(column_count, nullptr);
+
+            for (size_t col_idx = 0; col_idx < column_count; ++col_idx) {
+                auto& col = target_columns[col_idx];
+                if (col->is_nullable()) {
+                    auto* nullable_col =
+                            assert_cast<ColumnNullable*, TypeCheckOnRelease::DISABLE>(col.get());
+                    nullable_dst_cols[col_idx] = nullable_col;
+
+                    size_t old_size = nullable_col->size();
+                    size_t new_size = old_size + actual_rows;
+
+                    // Expand and fill null_map with all 1s (all NULL)
+                    nullable_col->get_null_map_column().get_data().resize_fill(new_size, 1);
+
+                    // Expand nested_column (data content doesn't matter since all NULL)
+                    nullable_col->get_nested_column().resize(new_size);
+                } else {
+                    // Non-Nullable column, reserve space
+                    col->reserve(col->size() + actual_rows);
+                }
+            }
+
+            // Step 3: Batch process each batch
+            size_t dst_offset = base_offset;
+
+            for (const auto& batch : batches) {
+                Block* src_block = batch.block.get();
+                DCHECK(src_block != nullptr);
+                DCHECK(src_block->columns() == column_count);
+
+                // Pre-cast source columns for this batch (once per batch, not per column iteration)
+                // Use static_cast in inner loop after verifying type once
+                for (size_t col_idx = 0; col_idx < column_count; ++col_idx) {
+                    ColumnNullable* nullable_dst = nullable_dst_cols[col_idx];
+
+                    if (nullable_dst != nullptr) {
+                        // Sparse optimization path - destination is nullable
+                        const auto& src_col = src_block->get_by_position(col_idx).column;
+                        // Use static_cast here since we already verified dst is nullable,
+                        // and schema consistency guarantees src is also nullable
+                        const auto* nullable_src =
+                                static_cast<const ColumnNullable*>(src_col.get());
+                        const auto& null_map = nullable_src->get_null_map_data();
+
+                        // Use SIMD to count non-NULL values
+                        size_t non_null_count = simd::count_zero_num(
+                                reinterpret_cast<const int8_t*>(null_map.data() + batch.start_row),
+                                static_cast<size_t>(batch.count));
+
+                        if (non_null_count == 0) {
+                            // All NULL, skip (already pre-filled)
+                        } else if (non_null_count == batch.count) {
+                            // All non-NULL, use batch copy
+                            nullable_dst->replace_column_data_range(*nullable_src, batch.start_row,
+                                                                    batch.count, dst_offset);
+                        } else {
+                            // Mixed case: replace non-NULL values one by one
+                            for (size_t i = 0; i < batch.count; i++) {
+                                if (null_map[batch.start_row + i] == 0) {
+                                    nullable_dst->replace_column_data(*nullable_src,
+                                                                      batch.start_row + i,
+                                                                      dst_offset + i);
+                                }
+                            }
+                        }
+                    } else {
+                        // Non-sparse optimization path / non-Nullable column
+                        const auto& src_col = src_block->get_by_position(col_idx).column;
+                        target_columns[col_idx]->insert_range_from(*src_col, batch.start_row,
+                                                                   batch.count);
+                    }
+                }
+
+                dst_offset += batch.count;
+            }
+
+            block->set_columns(std::move(target_columns));
+            return Status::OK();
+        }
+    }
+
+    // Fallback: original row-by-row processing
+    int target_block_row = 0;
     do {
         Status res = _vcollect_iter->unique_key_next_row(&_next_row);
         if (UNLIKELY(!res.ok())) {

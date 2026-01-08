@@ -743,6 +743,95 @@ Status VerticalMaskMergeIterator::unique_key_next_row(vectorized::IteratorRowRef
     return st;
 }
 
+Status VerticalMaskMergeIterator::unique_key_next_batch(std::vector<RowBatch>* batches,
+                                                        size_t max_rows, size_t* actual_rows) {
+    DCHECK(_row_sources_buf);
+    batches->clear();
+    *actual_rows = 0;
+
+    std::shared_ptr<Block> current_block;
+    uint32_t batch_start = 0;
+    uint32_t batch_count = 0;
+
+    while (*actual_rows < max_rows) {
+        // Check if RowSourceBuffer has remaining data
+        auto st = _row_sources_buf->has_remaining();
+        if (!st.ok()) {
+            if (st.is<END_OF_FILE>()) {
+                break;
+            }
+            return st;
+        }
+
+        auto row_source = _row_sources_buf->current();
+        uint16_t order = row_source.get_source_num();
+        auto& ctx = _origin_iter_ctx[order];
+
+        // Initialize context
+        RETURN_IF_ERROR(ctx->init(_opts, _sample_info));
+        if (!ctx->valid()) {
+            return Status::InternalError("VerticalMergeIteratorContext not valid");
+        }
+
+        // Keep row position aligned with row_sources_buf
+        bool is_first = ctx->is_first_row();
+        uint32_t row_pos = 0;
+        if (is_first && !row_source.agg_flag()) {
+            // First non-agg row: don't advance, just consume current row
+            row_pos = ctx->current_row_pos();
+            ctx->set_is_first_row(false);
+        } else {
+            RETURN_IF_ERROR(ctx->advance());
+            if (!row_source.agg_flag()) {
+                row_pos = ctx->current_row_pos();
+            }
+        }
+
+        _row_sources_buf->advance();
+
+        // Skip rows with agg_flag=true (unique key deduplication)
+        if (row_source.agg_flag()) {
+            _filtered_rows++;
+            continue;
+        }
+
+        // Get block snapshot for current row
+        auto block = ctx->block_ptr();
+
+        // Check if we can merge into current batch (same block and continuous rows)
+        if (current_block == block && row_pos == batch_start + batch_count) {
+            // Continuous row, merge into current batch
+            batch_count++;
+        } else {
+            // Save previous batch if exists
+            if (current_block != nullptr && batch_count > 0) {
+                batches->emplace_back(current_block, batch_start, batch_count);
+            }
+            // Start new batch
+            current_block = std::move(block);
+            batch_start = row_pos;
+            batch_count = 1;
+        }
+
+        (*actual_rows)++;
+    }
+
+    // Save the last batch
+    if (current_block != nullptr && batch_count > 0) {
+        batches->emplace_back(current_block, batch_start, batch_count);
+    }
+
+    // Check if we've reached the end
+    if (*actual_rows == 0) {
+        auto st = _row_sources_buf->has_remaining();
+        if (st.is<END_OF_FILE>()) {
+            RETURN_IF_ERROR(check_all_iter_finished());
+        }
+    }
+
+    return Status::OK();
+}
+
 Status VerticalMaskMergeIterator::next_batch(Block* block) {
     DCHECK(_row_sources_buf);
     size_t rows = 0;

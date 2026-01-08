@@ -213,6 +213,14 @@ public:
         }
     }
 
+    // Get current row position in block (for batch optimization)
+    uint32_t current_row_pos() const { return _index_in_block; }
+
+    // Get block pointer (for batch optimization)
+    Block* block() const { return _block.get(); }
+
+    const std::shared_ptr<Block>& block_ptr() const { return _block; }
+
 private:
     // Load next block into _block
     Status _load_next_block();
@@ -366,6 +374,17 @@ private:
     std::vector<RowLocation> _block_row_locations;
 };
 
+// --------------- RowBatch for batch optimization ------------- //
+// Batch of continuous rows from the same segment context
+struct RowBatch {
+    std::shared_ptr<Block> block;       // source block snapshot
+    uint32_t start_row;                 // start row position in source block
+    uint32_t count;                     // number of rows
+
+    RowBatch(std::shared_ptr<Block> b, uint32_t start, uint32_t cnt)
+            : block(std::move(b)), start_row(start), count(cnt) {}
+};
+
 // --------------- VerticalMaskMergeIterator ------------- //
 class VerticalMaskMergeIterator : public RowwiseIterator {
 public:
@@ -389,6 +408,11 @@ public:
     Status next_row(IteratorRowRef* ref) override;
 
     Status unique_key_next_row(IteratorRowRef* ref) override;
+
+    // Batch version of unique_key_next_row for performance optimization
+    // Returns batches of continuous rows from the same segment
+    Status unique_key_next_batch(std::vector<RowBatch>* batches, size_t max_rows,
+                                 size_t* actual_rows);
 
     uint64_t merged_rows() const override { return _filtered_rows; }
 
