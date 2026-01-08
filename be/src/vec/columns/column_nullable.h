@@ -310,8 +310,11 @@ public:
     }
 
     // Batch replace continuous range of data (for sparse compaction optimization)
+    // NOTE: This function is designed for "all non-NULL" scenario where the caller
+    // has already verified that all source values are non-NULL using SIMD count.
+    // For mixed NULL/non-NULL cases, use replace_column_data in a loop.
     void replace_column_data_range(const IColumn& rhs, size_t src_start, size_t count,
-                                   size_t self_start) {
+                                   size_t self_start) override{
         DCHECK(size() >= self_start + count);
         const auto& nullable_rhs =
                 assert_cast<const ColumnNullable&, TypeCheckOnRelease::DISABLE>(rhs);
@@ -320,15 +323,10 @@ public:
         memcpy(get_null_map_data().data() + self_start,
                nullable_rhs.get_null_map_data().data() + src_start, count);
 
-        // Copy nested column data
-        // For each position, only copy if source is not null
-        const auto& src_null_map = nullable_rhs.get_null_map_data();
-        for (size_t i = 0; i < count; ++i) {
-            if (src_null_map[src_start + i] == 0) {
-                _nested_column->replace_column_data(*nullable_rhs._nested_column, src_start + i,
-                                                    self_start + i);
-            }
-        }
+        // Batch copy nested column data using optimized replace_column_data_range
+        // This leverages memcpy in ColumnVector/ColumnDecimal for maximum performance
+        _nested_column->replace_column_data_range(*nullable_rhs._nested_column, src_start, count,
+                                                  self_start);
     }
 
     void replace_float_special_values() override { _nested_column->replace_float_special_values(); }

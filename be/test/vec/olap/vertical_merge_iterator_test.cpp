@@ -19,9 +19,12 @@
 
 #include "common/config.h"
 #include "util/simd/bits.h"
+#include "vec/columns/column_decimal.h"
 #include "vec/columns/column_nullable.h"
 #include "vec/columns/column_vector.h"
 #include "vec/common/assert_cast.h"
+#include "vec/core/block.h"
+#include "vec/olap/vertical_merge_iterator.h"
 
 namespace doris::vectorized {
 
@@ -400,6 +403,332 @@ TEST_F(SparseColumnOptimizationTest, CountZeroNumSIMD) {
     // Small sizes
     EXPECT_EQ(simd::count_zero_num(data.data(), static_cast<size_t>(1)), 1);  // single zero
     EXPECT_EQ(simd::count_zero_num(data.data() + 1, static_cast<size_t>(1)), 0);  // single one
+}
+
+// ==================== ColumnVector replace_column_data_range tests ====================
+
+TEST_F(SparseColumnOptimizationTest, ColumnVectorReplaceDataRange) {
+    // Test ColumnVector::replace_column_data_range with memcpy optimization
+    auto src = ColumnInt64::create();
+    for (Int64 i = 1; i <= 10; ++i) {
+        src->insert_value(i * 100);
+    }
+
+    // Create destination column with pre-allocated space
+    auto dst = ColumnInt64::create();
+    dst->get_data().resize(10, 0);  // Pre-fill with zeros
+
+    // Replace range [2, 6) from src to dst at position 3
+    dst->replace_column_data_range(*src, 2, 4, 3);
+
+    // Verify: dst[3..6] should be src[2..5] = {300, 400, 500, 600}
+    const auto& dst_data = dst->get_data();
+    EXPECT_EQ(dst_data[0], 0);   // unchanged
+    EXPECT_EQ(dst_data[1], 0);   // unchanged
+    EXPECT_EQ(dst_data[2], 0);   // unchanged
+    EXPECT_EQ(dst_data[3], 300); // src[2]
+    EXPECT_EQ(dst_data[4], 400); // src[3]
+    EXPECT_EQ(dst_data[5], 500); // src[4]
+    EXPECT_EQ(dst_data[6], 600); // src[5]
+    EXPECT_EQ(dst_data[7], 0);   // unchanged
+}
+
+TEST_F(SparseColumnOptimizationTest, ColumnVectorReplaceDataRangeFullCopy) {
+    // Test full range copy
+    constexpr size_t num_rows = 1024;
+    auto src = ColumnInt64::create();
+    for (size_t i = 0; i < num_rows; ++i) {
+        src->insert_value(static_cast<Int64>(i));
+    }
+
+    auto dst = ColumnInt64::create();
+    dst->get_data().resize(num_rows, -1);
+
+    // Replace entire range
+    dst->replace_column_data_range(*src, 0, num_rows, 0);
+
+    // Verify all values copied correctly
+    const auto& dst_data = dst->get_data();
+    for (size_t i = 0; i < num_rows; ++i) {
+        EXPECT_EQ(dst_data[i], static_cast<Int64>(i));
+    }
+}
+
+TEST_F(SparseColumnOptimizationTest, ColumnVectorReplaceDataRangeSingleElement) {
+    // Test single element replacement
+    auto src = ColumnInt64::create();
+    src->insert_value(42);
+    src->insert_value(99);
+
+    auto dst = ColumnInt64::create();
+    dst->get_data().resize(5, 0);
+
+    dst->replace_column_data_range(*src, 1, 1, 2);
+
+    EXPECT_EQ(dst->get_data()[2], 99);
+    EXPECT_EQ(dst->get_data()[0], 0);  // unchanged
+    EXPECT_EQ(dst->get_data()[4], 0);  // unchanged
+}
+
+// ==================== ColumnDecimal replace_column_data_range tests ====================
+
+TEST_F(SparseColumnOptimizationTest, ColumnDecimalReplaceDataRange) {
+    // Test ColumnDecimal::replace_column_data_range with memcpy optimization
+    // Use ColumnDecimal128V3 which is ColumnDecimal<TYPE_DECIMAL128I>
+    auto src = ColumnDecimal128V3::create(0, 2);  // scale = 2
+    for (int i = 1; i <= 10; ++i) {
+        src->insert_value(Decimal128V3(i * 100));
+    }
+
+    auto dst = ColumnDecimal128V3::create(0, 2);
+    dst->get_data().resize(10, Decimal128V3(0));
+
+    // Replace range
+    dst->replace_column_data_range(*src, 2, 4, 3);
+
+    const auto& dst_data = dst->get_data();
+    EXPECT_EQ(dst_data[3], Decimal128V3(300));
+    EXPECT_EQ(dst_data[4], Decimal128V3(400));
+    EXPECT_EQ(dst_data[5], Decimal128V3(500));
+    EXPECT_EQ(dst_data[6], Decimal128V3(600));
+    EXPECT_EQ(dst_data[0], Decimal128V3(0));  // unchanged
+}
+
+// ==================== RowBatch structure tests ====================
+
+TEST_F(SparseColumnOptimizationTest, RowBatchConstruction) {
+    // Test RowBatch construction and member access
+    auto block = std::make_shared<Block>();
+
+    // Add a column to the block
+    auto col = ColumnInt64::create();
+    col->insert_value(1);
+    col->insert_value(2);
+    col->insert_value(3);
+    block->insert({std::move(col), std::make_shared<DataTypeInt64>(), "test_col"});
+
+    // Create RowBatch
+    RowBatch batch(block, 1, 2);  // start_row=1, count=2
+
+    EXPECT_EQ(batch.block.get(), block.get());
+    EXPECT_EQ(batch.start_row, 1);
+    EXPECT_EQ(batch.count, 2);
+
+    // Verify block content accessible through batch
+    const auto& batch_col = batch.block->get_by_position(0).column;
+    EXPECT_EQ(batch_col->size(), 3);
+}
+
+TEST_F(SparseColumnOptimizationTest, RowBatchSharedPtrLifetime) {
+    // Test that RowBatch keeps block alive via shared_ptr
+    RowBatch batch(nullptr, 0, 0);
+
+    {
+        auto block = std::make_shared<Block>();
+        auto col = ColumnInt64::create();
+        col->insert_value(42);
+        block->insert({std::move(col), std::make_shared<DataTypeInt64>(), "col"});
+
+        batch = RowBatch(block, 0, 1);
+        // block goes out of scope here, but batch keeps it alive
+    }
+
+    // Block should still be accessible
+    EXPECT_NE(batch.block, nullptr);
+    EXPECT_EQ(batch.block->columns(), 1);
+    EXPECT_EQ(batch.block->get_by_position(0).column->size(), 1);
+}
+
+TEST_F(SparseColumnOptimizationTest, RowBatchVector) {
+    // Test vector of RowBatches (simulating batches from unique_key_next_batch)
+    std::vector<RowBatch> batches;
+
+    // Create multiple blocks and batches
+    for (int i = 0; i < 3; ++i) {
+        auto block = std::make_shared<Block>();
+        auto col = ColumnInt64::create();
+        for (int j = 0; j < 10; ++j) {
+            col->insert_value(i * 10 + j);
+        }
+        block->insert({std::move(col), std::make_shared<DataTypeInt64>(), "col"});
+
+        batches.emplace_back(block, i * 2, 5);  // Different start positions
+    }
+
+    EXPECT_EQ(batches.size(), 3);
+
+    // Verify each batch
+    for (size_t i = 0; i < batches.size(); ++i) {
+        EXPECT_EQ(batches[i].start_row, i * 2);
+        EXPECT_EQ(batches[i].count, 5);
+        EXPECT_NE(batches[i].block, nullptr);
+    }
+}
+
+// ==================== All-non-NULL batch optimization tests ====================
+
+TEST_F(SparseColumnOptimizationTest, AllNonNullBatchOptimization) {
+    // Test the complete flow for all-non-NULL scenario
+    // This simulates what happens in vertical_block_reader when non_null_count == batch.count
+
+    // Create source nullable column (all non-NULL)
+    std::vector<Int64> values = {10, 20, 30, 40, 50};
+    std::vector<bool> null_flags = {false, false, false, false, false};
+    auto src = create_nullable_column(values, null_flags);
+    const auto* nullable_src = assert_cast<const ColumnNullable*>(src.get());
+
+    // Create destination with pre-filled NULLs (simulating sparse optimization)
+    auto dst = ColumnNullable::create(ColumnInt64::create(), ColumnUInt8::create());
+    auto* nullable_dst = assert_cast<ColumnNullable*>(dst.get());
+
+    // Pre-fill with NULLs
+    nullable_dst->get_null_map_column().get_data().resize_fill(5, 1);  // all NULL
+    nullable_dst->get_nested_column().resize(5);
+
+    // Check non-NULL count using SIMD
+    const auto& null_map = nullable_src->get_null_map_data();
+    size_t non_null_count = simd::count_zero_num(
+            reinterpret_cast<const int8_t*>(null_map.data()), 5);
+
+    EXPECT_EQ(non_null_count, 5);  // All non-NULL
+
+    // Since all non-NULL, use batch replace (triggers memcpy optimization)
+    nullable_dst->replace_column_data_range(*nullable_src, 0, 5, 0);
+
+    // Verify results
+    EXPECT_EQ(nullable_dst->size(), 5);
+    for (size_t i = 0; i < 5; ++i) {
+        EXPECT_FALSE(nullable_dst->is_null_at(i));
+    }
+
+    const auto& nested = assert_cast<const ColumnInt64&>(nullable_dst->get_nested_column());
+    EXPECT_EQ(nested.get_element(0), 10);
+    EXPECT_EQ(nested.get_element(1), 20);
+    EXPECT_EQ(nested.get_element(2), 30);
+    EXPECT_EQ(nested.get_element(3), 40);
+    EXPECT_EQ(nested.get_element(4), 50);
+}
+
+TEST_F(SparseColumnOptimizationTest, BatchReplaceWithOffset) {
+    // Test batch replace at non-zero offset (simulating multiple batches)
+    std::vector<Int64> values1 = {1, 2, 3};
+    std::vector<bool> null_flags1 = {false, false, false};
+    auto src1 = create_nullable_column(values1, null_flags1);
+
+    std::vector<Int64> values2 = {4, 5};
+    std::vector<bool> null_flags2 = {false, false};
+    auto src2 = create_nullable_column(values2, null_flags2);
+
+    // Create destination pre-filled with NULLs
+    auto dst = ColumnNullable::create(ColumnInt64::create(), ColumnUInt8::create());
+    auto* nullable_dst = assert_cast<ColumnNullable*>(dst.get());
+
+    nullable_dst->get_null_map_column().get_data().resize_fill(5, 1);
+    nullable_dst->get_nested_column().resize(5);
+
+    // Batch 1: replace at offset 0, count 3
+    nullable_dst->replace_column_data_range(*src1, 0, 3, 0);
+
+    // Batch 2: replace at offset 3, count 2
+    nullable_dst->replace_column_data_range(*src2, 0, 2, 3);
+
+    // Verify
+    const auto& nested = assert_cast<const ColumnInt64&>(nullable_dst->get_nested_column());
+    EXPECT_EQ(nested.get_element(0), 1);
+    EXPECT_EQ(nested.get_element(1), 2);
+    EXPECT_EQ(nested.get_element(2), 3);
+    EXPECT_EQ(nested.get_element(3), 4);
+    EXPECT_EQ(nested.get_element(4), 5);
+
+    // All should be non-NULL
+    for (size_t i = 0; i < 5; ++i) {
+        EXPECT_FALSE(nullable_dst->is_null_at(i));
+    }
+}
+
+TEST_F(SparseColumnOptimizationTest, MixedBatchProcessing) {
+    // Test mixed scenario: some batches all-NULL, some all-non-NULL, some mixed
+    auto dst = ColumnNullable::create(ColumnInt64::create(), ColumnUInt8::create());
+    auto* nullable_dst = assert_cast<ColumnNullable*>(dst.get());
+
+    // Pre-fill with 15 NULLs
+    nullable_dst->get_null_map_column().get_data().resize_fill(15, 1);
+    nullable_dst->get_nested_column().resize(15);
+
+    // Batch 1 (offset 0-4): All NULL - skip (already pre-filled)
+    // Nothing to do
+
+    // Batch 2 (offset 5-9): All non-NULL - use batch replace
+    std::vector<Int64> values2 = {50, 51, 52, 53, 54};
+    std::vector<bool> null_flags2 = {false, false, false, false, false};
+    auto src2 = create_nullable_column(values2, null_flags2);
+    nullable_dst->replace_column_data_range(*src2, 0, 5, 5);
+
+    // Batch 3 (offset 10-14): Mixed - use per-row replace
+    std::vector<Int64> values3 = {100, 101, 102, 103, 104};
+    std::vector<bool> null_flags3 = {false, true, false, true, false};
+    auto src3 = create_nullable_column(values3, null_flags3);
+    const auto* nullable_src3 = assert_cast<const ColumnNullable*>(src3.get());
+    const auto& null_map3 = nullable_src3->get_null_map_data();
+
+    for (size_t i = 0; i < 5; ++i) {
+        if (null_map3[i] == 0) {  // non-NULL
+            nullable_dst->replace_column_data(*src3, i, 10 + i);
+        }
+    }
+
+    // Verify results
+    // Batch 1: All NULL
+    for (size_t i = 0; i < 5; ++i) {
+        EXPECT_TRUE(nullable_dst->is_null_at(i)) << "Position " << i << " should be NULL";
+    }
+
+    // Batch 2: All non-NULL
+    const auto& nested = assert_cast<const ColumnInt64&>(nullable_dst->get_nested_column());
+    for (size_t i = 5; i < 10; ++i) {
+        EXPECT_FALSE(nullable_dst->is_null_at(i)) << "Position " << i << " should be non-NULL";
+        EXPECT_EQ(nested.get_element(i), 50 + (i - 5));
+    }
+
+    // Batch 3: Mixed pattern
+    EXPECT_FALSE(nullable_dst->is_null_at(10));
+    EXPECT_EQ(nested.get_element(10), 100);
+    EXPECT_TRUE(nullable_dst->is_null_at(11));
+    EXPECT_FALSE(nullable_dst->is_null_at(12));
+    EXPECT_EQ(nested.get_element(12), 102);
+    EXPECT_TRUE(nullable_dst->is_null_at(13));
+    EXPECT_FALSE(nullable_dst->is_null_at(14));
+    EXPECT_EQ(nested.get_element(14), 104);
+}
+
+TEST_F(SparseColumnOptimizationTest, LargeBatchMemcpyPerformance) {
+    // Test large batch to verify memcpy optimization works correctly
+    constexpr size_t num_rows = 4096;  // Typical batch size
+
+    // Create source with all non-NULL values
+    auto src_nested = ColumnInt64::create();
+    auto src_null_map = ColumnUInt8::create();
+    for (size_t i = 0; i < num_rows; ++i) {
+        src_nested->insert_value(static_cast<Int64>(i * 2));
+        src_null_map->insert_value(0);  // all non-NULL
+    }
+    auto src = ColumnNullable::create(std::move(src_nested), std::move(src_null_map));
+
+    // Create destination pre-filled with NULLs
+    auto dst = ColumnNullable::create(ColumnInt64::create(), ColumnUInt8::create());
+    auto* nullable_dst = assert_cast<ColumnNullable*>(dst.get());
+    nullable_dst->get_null_map_column().get_data().resize_fill(num_rows, 1);
+    nullable_dst->get_nested_column().resize(num_rows);
+
+    // Batch replace (should use memcpy)
+    nullable_dst->replace_column_data_range(*src, 0, num_rows, 0);
+
+    // Verify correctness
+    const auto& nested = assert_cast<const ColumnInt64&>(nullable_dst->get_nested_column());
+    for (size_t i = 0; i < num_rows; ++i) {
+        EXPECT_FALSE(nullable_dst->is_null_at(i));
+        EXPECT_EQ(nested.get_element(i), static_cast<Int64>(i * 2));
+    }
 }
 
 } // namespace doris::vectorized
