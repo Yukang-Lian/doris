@@ -622,13 +622,29 @@ Status VerticalBlockReader::_unique_key_next_block(Block* block, bool* eof) {
                             nullable_dst->replace_column_data_range(*nullable_src, batch.start_row,
                                                                     batch.count, dst_offset);
                         } else {
-                            // Mixed case: replace non-NULL values one by one
-                            for (size_t i = 0; i < batch.count; i++) {
-                                if (null_map[batch.start_row + i] == 0) {
-                                    nullable_dst->replace_column_data(*nullable_src,
-                                                                      batch.start_row + i,
-                                                                      dst_offset + i);
+                            // Mixed case: use run-length encoding to batch replace non-NULL runs
+                            // This is more efficient than per-row replacement when non-NULLs are clustered
+                            size_t i = 0;
+                            while (i < batch.count) {
+                                // Skip NULL values (null_map == 1)
+                                while (i < batch.count &&
+                                       null_map[batch.start_row + i] != 0) {
+                                    i++;
                                 }
+                                if (i >= batch.count) break;
+
+                                // Found start of non-NULL run
+                                size_t run_start = i;
+                                while (i < batch.count &&
+                                       null_map[batch.start_row + i] == 0) {
+                                    i++;
+                                }
+                                size_t run_length = i - run_start;
+
+                                // Batch copy this non-NULL run
+                                nullable_dst->replace_column_data_range(
+                                        *nullable_src, batch.start_row + run_start, run_length,
+                                        dst_offset + run_start);
                             }
                         }
                     } else {

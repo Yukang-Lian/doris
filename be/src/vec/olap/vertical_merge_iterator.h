@@ -121,6 +121,13 @@ public:
     // return continuous agg_flag=true count from index
     size_t continuous_agg_count(uint64_t index);
 
+    // Count continuous rows from current position that:
+    // 1. Have the same source number
+    // 2. Have agg_flag=false (non-aggregated rows)
+    // Stops at first agg_flag=true row or different source
+    // Used for batch optimization in unique_key_next_batch
+    size_t same_source_continuous_non_agg_count(uint16_t source, size_t limit);
+
 private:
     Status _create_buffer_file();
     Status _serialize();
@@ -167,6 +174,10 @@ public:
     Status copy_rows(Block* block, size_t count);
 
     Status advance();
+
+    // Advance by n rows at once (batch optimization)
+    // More efficient than calling advance() n times when n rows are in same block
+    Status advance_by(size_t n);
 
     // Return if it has remaining data in this context.
     // Only when this function return true, current_row()
