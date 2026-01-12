@@ -435,15 +435,31 @@ template <typename T>
 void RleEncoder<T>::Put(T value, size_t run_length) {
     DCHECK(bit_width_ == 64 || value < (1LL << bit_width_));
 
-    // TODO(perf): remove the loop and use the repeat_count_
+    if (run_length == 0) [[unlikely]] {
+        return;
+    }
+
+    // Fast path: if we're already in a repeated run with the same value,
+    // we can skip the loop entirely and just add to repeat_count_.
+    // This is the common case for sparse wide table compaction where
+    // entire columns are NULL (calling Put(true, 4096) for null bitmap).
+    if (current_value_ == value && repeat_count_ >= 8) [[likely]] {
+        repeat_count_ += static_cast<int>(run_length);
+        return;
+    }
+
+    // Handle the remaining cases with the loop, but optimize to exit early
+    // once we enter the fast repeated run state
     for (; run_length > 0; run_length--) {
         if (current_value_ == value) [[likely]] {
             ++repeat_count_;
             if (repeat_count_ > 8) {
-                // This is just a continuation of the current run, no need to buffer the
-                // values.
-                // Note that this is the fast path for long repeated runs.
-                continue;
+                // We've now buffered 8+ values of the same type.
+                // Add remaining run_length directly to repeat_count_ and return.
+                if (run_length > 1) {
+                    repeat_count_ += static_cast<int>(run_length - 1);
+                }
+                return;
             }
         } else {
             if (repeat_count_ >= 8) {

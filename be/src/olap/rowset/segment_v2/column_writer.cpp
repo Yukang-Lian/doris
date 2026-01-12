@@ -44,6 +44,7 @@
 #include "util/debug_points.h"
 #include "util/faststring.h"
 #include "util/rle_encoding.h"
+#include "util/simd/bits.h"
 #include "vec/core/types.h"
 #include "vec/data_types/data_type_agg_state.h"
 #include "vec/data_types/data_type_factory.hpp"
@@ -362,6 +363,23 @@ Status ColumnWriter::append_nullable(const uint8_t* is_null_bits, const void* da
 
 Status ColumnWriter::append_nullable(const uint8_t* null_map, const uint8_t** ptr,
                                      size_t num_rows) {
+    // Fast path: use SIMD to detect all-NULL or all-non-NULL columns
+    // This is common for sparse wide tables where most columns are entirely NULL
+    size_t non_null_count = simd::count_zero_num(reinterpret_cast<const int8_t*>(null_map), num_rows);
+
+    if (non_null_count == 0) {
+        // All NULL: skip run-length iteration, directly append all nulls
+        RETURN_IF_ERROR(append_nulls(num_rows));
+        *ptr += get_field()->size() * num_rows;
+        return Status::OK();
+    }
+
+    if (non_null_count == num_rows) {
+        // All non-NULL: skip run-length iteration, directly append all data
+        return append_data(ptr, num_rows);
+    }
+
+    // Mixed case: use run-length processing
     size_t offset = 0;
     auto next_run_step = [&]() {
         size_t step = 1;
