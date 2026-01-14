@@ -566,6 +566,9 @@ Status VerticalBlockReader::_unique_key_next_block(Block* block, bool* eof) {
             // Step 2: Sparse optimization - pre-fill with NULL and pre-cast destination columns
             // Pre-cast destination columns outside the loop to avoid repeated assert_cast
             std::vector<ColumnNullable*> nullable_dst_cols(column_count, nullptr);
+            // Track which columns support in-place replacement (fixed-width types)
+            // Variable-length types (strings, arrays) need insert-based approach
+            std::vector<bool> supports_replace(column_count, false);
 
             for (size_t col_idx = 0; col_idx < column_count; ++col_idx) {
                 auto& col = target_columns[col_idx];
@@ -573,15 +576,22 @@ Status VerticalBlockReader::_unique_key_next_block(Block* block, bool* eof) {
                     auto* nullable_col =
                             assert_cast<ColumnNullable*, TypeCheckOnRelease::DISABLE>(col.get());
                     nullable_dst_cols[col_idx] = nullable_col;
+                    supports_replace[col_idx] = nullable_col->support_replace_column_data_range();
 
-                    size_t old_size = nullable_col->size();
-                    size_t new_size = old_size + actual_rows;
+                    if (supports_replace[col_idx]) {
+                        // Fixed-width types: pre-fill with NULL for sparse optimization
+                        size_t old_size = nullable_col->size();
+                        size_t new_size = old_size + actual_rows;
 
-                    // Expand and fill null_map with all 1s (all NULL)
-                    nullable_col->get_null_map_column().get_data().resize_fill(new_size, 1);
+                        // Expand and fill null_map with all 1s (all NULL)
+                        nullable_col->get_null_map_column().get_data().resize_fill(new_size, 1);
 
-                    // Expand nested_column (data content doesn't matter since all NULL)
-                    nullable_col->get_nested_column().resize(new_size);
+                        // Expand nested_column (data content doesn't matter since all NULL)
+                        nullable_col->get_nested_column().resize(new_size);
+                    } else {
+                        // Variable-length types: just reserve space, will use insert operations
+                        col->reserve(col->size() + actual_rows);
+                    }
                 } else {
                     // Non-Nullable column, reserve space
                     col->reserve(col->size() + actual_rows);
@@ -601,8 +611,8 @@ Status VerticalBlockReader::_unique_key_next_block(Block* block, bool* eof) {
                 for (size_t col_idx = 0; col_idx < column_count; ++col_idx) {
                     ColumnNullable* nullable_dst = nullable_dst_cols[col_idx];
 
-                    if (nullable_dst != nullptr) {
-                        // Sparse optimization path - destination is nullable
+                    if (nullable_dst != nullptr && supports_replace[col_idx]) {
+                        // Sparse optimization path for fixed-width types - pre-filled with NULL
                         const auto& src_col = src_block->get_by_position(col_idx).column;
                         // Use static_cast here since we already verified dst is nullable,
                         // and schema consistency guarantees src is also nullable
@@ -647,6 +657,13 @@ Status VerticalBlockReader::_unique_key_next_block(Block* block, bool* eof) {
                                         dst_offset + run_start);
                             }
                         }
+                    } else if (nullable_dst != nullptr) {
+                        // Variable-length types (strings, arrays) - use insert-based approach
+                        const auto& src_col = src_block->get_by_position(col_idx).column;
+                        // Use insert_range_from for variable-length types
+                        // This properly handles variable-length data like strings
+                        target_columns[col_idx]->insert_range_from(*src_col, batch.start_row,
+                                                                   batch.count);
                     } else {
                         // Non-sparse optimization path / non-Nullable column
                         const auto& src_col = src_block->get_by_position(col_idx).column;

@@ -686,6 +686,12 @@ public:
             replace_column_data(src, src_start + i, self_start + i);
         }
     }
+    // Whether this column type supports efficient in-place range replacement.
+    // Returns true for fixed-width types (ColumnVector, ColumnDecimal) that can use memcpy.
+    // Returns false for variable-length types (ColumnString, ColumnArray, etc.) that require
+    // more complex handling. Used by sparse column compaction to choose the right code path.
+    virtual bool support_replace_column_data_range() const { return false; }
+
     // replace data to default value if null, used to avoid null data output decimal check failure
     // usage: nested_column.replace_column_null_data(nested_null_map.data())
     // only wrok on column_vector and column column decimal, there will be no behavior when other columns type call this method

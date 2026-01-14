@@ -329,6 +329,11 @@ public:
                                                   self_start);
     }
 
+    // Delegate to nested column - only fixed-width types support efficient replacement
+    bool support_replace_column_data_range() const override {
+        return _nested_column->support_replace_column_data_range();
+    }
+
     void replace_float_special_values() override { _nested_column->replace_float_special_values(); }
 
     MutableColumnPtr convert_to_predicate_column_if_dictionary() override {

@@ -351,6 +351,8 @@ public:
                count * sizeof(value_type));
     }
 
+    bool support_replace_column_data_range() const override { return true; }
+
     void replace_column_null_data(const uint8_t* __restrict null_map) override;
 
     bool support_replace_column_null_data() const override { return true; }
