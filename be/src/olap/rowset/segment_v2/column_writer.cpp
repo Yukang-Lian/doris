@@ -20,6 +20,7 @@
 #include <gen_cpp/segment_v2.pb.h>
 
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 
@@ -61,6 +62,27 @@ public:
               _bitmap_buf(BitmapSize(reserve_bits)),
               _rle_encoder(&_bitmap_buf, 1) {}
 
+    void reserve_for_write(size_t num_rows, size_t non_null_count) {
+        if (num_rows == 0) {
+            return;
+        }
+        if (non_null_count == 0 || (non_null_count == num_rows && !_has_null)) {
+            if (_bitmap_buf.capacity() < kSmallReserveBytes) {
+                _bitmap_buf.reserve(kSmallReserveBytes);
+            }
+            return;
+        }
+        size_t raw_bytes = BitmapSize(num_rows);
+        size_t run_est = std::min(num_rows, non_null_count * 2 + 1);
+        size_t run_bytes_est = run_est * kBytesPerRun + kReserveSlackBytes;
+        size_t raw_overhead = raw_bytes / 63 + 1;
+        size_t raw_est = raw_bytes + raw_overhead + kReserveSlackBytes;
+        size_t reserve_bytes = std::min(raw_est, run_bytes_est);
+        if (_bitmap_buf.capacity() < reserve_bytes) {
+            _bitmap_buf.reserve(reserve_bytes);
+        }
+    }
+
     void add_run(bool value, size_t run) {
         _has_null |= value;
         _rle_encoder.Put(value, run);
@@ -83,6 +105,10 @@ public:
     uint64_t size() { return _bitmap_buf.size(); }
 
 private:
+    static constexpr size_t kSmallReserveBytes = 64;
+    static constexpr size_t kReserveSlackBytes = 16;
+    static constexpr size_t kBytesPerRun = 6;
+
     bool _has_null;
     faststring _bitmap_buf;
     RleEncoder<bool> _rle_encoder;
@@ -599,6 +625,71 @@ Status ScalarColumnWriter::_internal_append_data_in_current_page(const uint8_t* 
 Status ScalarColumnWriter::append_data_in_current_page(const uint8_t** data, size_t* num_written) {
     RETURN_IF_ERROR(append_data_in_current_page(*data, num_written));
     *data += get_field()->size() * (*num_written);
+    return Status::OK();
+}
+
+Status ScalarColumnWriter::append_nullable(const uint8_t* null_map, const uint8_t** ptr,
+                                           size_t num_rows) {
+    if (UNLIKELY(num_rows == 0)) {
+        return Status::OK();
+    }
+
+    _null_run_buffer.clear();
+    if (_null_run_buffer.capacity() < num_rows) {
+        _null_run_buffer.reserve(std::min(num_rows, size_t(256)));
+    }
+
+    size_t non_null_count = 0;
+    size_t offset = 0;
+    while (offset < num_rows) {
+        bool is_null = null_map[offset] != 0;
+        size_t remaining = num_rows - offset;
+        const uint8_t* run_end = static_cast<const uint8_t*>(
+                memchr(null_map + offset, is_null ? 0 : 1, remaining));
+        size_t run_length = run_end != nullptr ? (run_end - (null_map + offset)) : remaining;
+        _null_run_buffer.push_back(
+                NullRun {is_null, static_cast<uint32_t>(run_length)});
+        if (!is_null) {
+            non_null_count += run_length;
+        }
+        offset += run_length;
+    }
+
+    if (_null_bitmap_builder != nullptr) {
+        size_t current_rows = _next_rowid - _first_rowid;
+        size_t expected_rows = current_rows + num_rows;
+        size_t est_non_null = non_null_count;
+        if (num_rows > 0 && expected_rows > num_rows) {
+            est_non_null = (non_null_count * expected_rows) / num_rows;
+        }
+        _null_bitmap_builder->reserve_for_write(expected_rows, est_non_null);
+    }
+
+    if (non_null_count == 0) {
+        // All NULL: skip data writing, only update null bitmap and indexes
+        RETURN_IF_ERROR(append_nulls(num_rows));
+        *ptr += get_field()->size() * num_rows;
+        return Status::OK();
+    }
+
+    if (non_null_count == num_rows) {
+        // All non-NULL: use normal append_data which handles both data and null bitmap
+        return append_data(ptr, num_rows);
+    }
+
+    for (const auto& run : _null_run_buffer) {
+        size_t run_length = run.len;
+        if (run.is_null) {
+            RETURN_IF_ERROR(append_nulls(run_length));
+            *ptr += get_field()->size() * run_length;
+        } else {
+            // TODO:
+            //  1. `*ptr += get_field()->size() * step;` should do in this function, not append_data;
+            //  2. support array vectorized load and ptr offset add
+            RETURN_IF_ERROR(append_data(ptr, run_length));
+        }
+    }
+
     return Status::OK();
 }
 
