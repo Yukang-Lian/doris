@@ -125,6 +125,10 @@ private:
     phmap::flat_hash_map<const Block*, std::vector<std::pair<int, int>>> _temp_ref_map;
 
     std::vector<RowLocation> _block_row_locations;
+
+    // For sparse column compaction optimization
+    // Set from reader_params.use_sparse_optimization (calculated in Merger::vertical_merge_rowsets)
+    bool _use_sparse_optimization = false;
 };
 
 } // namespace vectorized
