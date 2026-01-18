@@ -434,7 +434,7 @@ DEFINE_mInt64(vertical_compaction_max_segment_size, "1073741824");
 // Default 100 means enable when each row averages less than 100 bytes
 DEFINE_mInt64(sparse_column_compaction_threshold, "1000000000");
 // Enable RLE batch Put optimization for compaction
-DEFINE_mBool(enable_rle_batch_put_optimization, "false");
+DEFINE_mBool(enable_rle_batch_put_optimization, "true");
 
 // If enabled, segments will be flushed column by column
 DEFINE_mBool(enable_vertical_segment_writer, "true");
