@@ -247,7 +247,7 @@ Status Merger::vertical_compact_one_group(
         const std::vector<RowsetReaderSharedPtr>& src_rowset_readers,
         RowsetWriter* dst_rowset_writer, uint32_t max_rows_per_segment, Statistics* stats_output,
         std::vector<uint32_t> key_group_cluster_key_idxes, int64_t batch_size,
-        CompactionSampleInfo* sample_info) {
+        CompactionSampleInfo* sample_info, bool use_sparse_optimization) {
     // build tablet reader
     VLOG_NOTICE << "vertical compact one group, max_rows_per_segment=" << max_rows_per_segment;
     vectorized::VerticalBlockReader reader(row_source_buf);
@@ -256,6 +256,7 @@ Status Merger::vertical_compact_one_group(
     reader_params.key_group_cluster_key_idxes = key_group_cluster_key_idxes;
     reader_params.tablet = tablet;
     reader_params.reader_type = reader_type;
+    reader_params.use_sparse_optimization = use_sparse_optimization;
 
     TabletReadSource read_source;
     read_source.rs_splits.reserve(src_rowset_readers.size());
@@ -477,6 +478,33 @@ Status Merger::vertical_merge_rowsets(BaseTabletSPtr tablet, ReaderType reader_t
     std::vector<uint32_t> key_group_cluster_key_idxes;
     vertical_split_columns(tablet_schema, &column_groups, &key_group_cluster_key_idxes);
 
+    // Calculate average bytes per row for sparse wide table optimization
+    // When avg_row_bytes <= threshold, enable sparse optimization
+    // threshold = 0 means disable, INT64_MAX means always enable
+    bool use_sparse_optimization = false;
+    if (config::sparse_column_compaction_threshold > 0 &&
+        tablet->keys_type() == KeysType::UNIQUE_KEYS) {
+        int64_t actual_data_size = 0;
+        int64_t total_rows = 0;
+        for (const auto& rs_reader : src_rowset_readers) {
+            actual_data_size += rs_reader->rowset()->rowset_meta()->data_disk_size();
+            total_rows += rs_reader->rowset()->rowset_meta()->num_rows();
+        }
+
+        if (total_rows > 0) {
+            int64_t avg_row_bytes = actual_data_size / total_rows;
+            use_sparse_optimization =
+                    avg_row_bytes <= config::sparse_column_compaction_threshold;
+
+            LOG(INFO) << "Vertical compaction sparse optimization check: tablet_id="
+                      << tablet->tablet_id() << ", avg_row_bytes=" << avg_row_bytes
+                      << ", threshold=" << config::sparse_column_compaction_threshold
+                      << ", total_rows=" << total_rows
+                      << ", actual_data_size=" << actual_data_size
+                      << ", use_sparse_optimization=" << use_sparse_optimization;
+        }
+    }
+
     vectorized::RowSourcesBuffer row_sources_buf(
             tablet->tablet_id(), dst_rowset_writer->context().tablet_path, reader_type);
     Merger::Statistics total_stats;
@@ -501,7 +529,7 @@ Status Merger::vertical_merge_rowsets(BaseTabletSPtr tablet, ReaderType reader_t
         Status st = vertical_compact_one_group(
                 tablet, reader_type, tablet_schema, is_key, column_groups[i], &row_sources_buf,
                 src_rowset_readers, dst_rowset_writer, max_rows_per_segment, group_stats_ptr,
-                key_group_cluster_key_idxes, batch_size, &sample_info);
+                key_group_cluster_key_idxes, batch_size, &sample_info, use_sparse_optimization);
         {
             std::unique_lock<std::mutex> lock(tablet->sample_info_lock);
             tablet->sample_infos[i] = sample_info;

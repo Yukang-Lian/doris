@@ -480,6 +480,13 @@ DECLARE_mInt32(vertical_compaction_num_columns_per_group);
 DECLARE_Int32(vertical_compaction_max_row_source_memory_mb);
 // In vertical compaction, max dest segment file size
 DECLARE_mInt64(vertical_compaction_max_segment_size);
+// Threshold for sparse column compaction optimization (average bytes per row)
+// When avg_row_bytes <= threshold, enable sparse optimization
+// 0 = disable optimization, INT64_MAX = always enable
+// Default 100 means enable when each row averages less than 100 bytes
+DECLARE_mInt64(sparse_column_compaction_threshold);
+// Enable RLE batch Put optimization for compaction
+DECLARE_mBool(enable_rle_batch_put_optimization);
 
 // If enabled, segments will be flushed column by column
 DECLARE_mBool(enable_vertical_segment_writer);

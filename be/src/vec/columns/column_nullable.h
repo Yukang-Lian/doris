@@ -314,10 +314,11 @@ public:
     // has already verified that all source values are non-NULL using SIMD count.
     // For mixed NULL/non-NULL cases, use replace_column_data in a loop.
     void replace_column_data_range(const IColumn& rhs, size_t src_start, size_t count,
-                                   size_t self_start) override{
+                                   size_t self_start) override {
         DCHECK(size() >= self_start + count);
         const auto& nullable_rhs =
                 assert_cast<const ColumnNullable&, TypeCheckOnRelease::DISABLE>(rhs);
+        DCHECK(nullable_rhs.size() >= src_start + count);
 
         // Copy null_map using memcpy for efficiency
         memcpy(get_null_map_data().data() + self_start,

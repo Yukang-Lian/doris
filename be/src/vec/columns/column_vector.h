@@ -347,6 +347,7 @@ public:
                                    size_t self_start) override {
         DCHECK(size() >= self_start + count);
         const auto& src_col = assert_cast<const Self&, TypeCheckOnRelease::DISABLE>(src);
+        DCHECK(src_col.size() >= src_start + count);
         memcpy(data.data() + self_start, src_col.data.data() + src_start,
                count * sizeof(value_type));
     }

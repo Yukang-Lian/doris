@@ -261,8 +261,8 @@ Status VerticalBlockReader::init(const ReaderParams& read_params,
         break;
     }
 
-    // Enable sparse optimization (will be controlled by config in later commit)
-    _use_sparse_optimization = true;
+    // Use sparse optimization flag from ReaderParams (calculated in merger.cpp based on avg_row_bytes threshold)
+    _use_sparse_optimization = read_params.use_sparse_optimization;
 
     return Status::OK();
 }
@@ -545,13 +545,12 @@ Status VerticalBlockReader::_unique_key_next_block(Block* block, bool* eof) {
         return Status::OK();
     }
 
-    // Value column processing - use batch optimization if enabled
+    // Value column processing - use batch optimization
     auto target_columns = block->mutate_columns();
     const size_t column_count = block->columns();
 
-    // Try to use batch optimization for sparse column compaction
-    // (will be controlled by config in later commit)
-    if (true) {
+    // Try to use batch optimization for value column compaction
+    {
         auto* mask_iter = dynamic_cast<VerticalMaskMergeIterator*>(_vcollect_iter.get());
         if (mask_iter != nullptr) {
             // Step 1: Batch fetch row information
