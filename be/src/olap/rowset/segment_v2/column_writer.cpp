@@ -390,8 +390,7 @@ Status ColumnWriter::append_nullable(const uint8_t* is_null_bits, const void* da
 Status ColumnWriter::append_nullable(const uint8_t* null_map, const uint8_t** ptr,
                                      size_t num_rows) {
     // Fast path: use SIMD to detect all-NULL or all-non-NULL columns
-    // (will be controlled by config in later commit)
-    if (true) {
+    if (config::enable_rle_batch_put_optimization) {
         size_t non_null_count =
                 simd::count_zero_num(reinterpret_cast<const int8_t*>(null_map), num_rows);
 
@@ -633,6 +632,11 @@ Status ScalarColumnWriter::append_data_in_current_page(const uint8_t** data, siz
 
 Status ScalarColumnWriter::append_nullable(const uint8_t* null_map, const uint8_t** ptr,
                                            size_t num_rows) {
+    // When optimization is disabled, use base class implementation
+    if (!config::enable_rle_batch_put_optimization) {
+        return ColumnWriter::append_nullable(null_map, ptr, num_rows);
+    }
+
     if (UNLIKELY(num_rows == 0)) {
         return Status::OK();
     }

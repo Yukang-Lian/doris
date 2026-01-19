@@ -21,6 +21,7 @@
 #include <limits> // IWYU pragma: keep
 
 #include "common/cast_set.h"
+#include "common/config.h"
 #include "util/bit_stream_utils.inline.h"
 #include "util/bit_util.h"
 
@@ -439,8 +440,8 @@ void RleEncoder<T>::Put(T value, size_t run_length) {
         return;
     }
 
-    // Fast path optimization (will be controlled by config in later commit)
-    if (true) {
+    // Fast path optimization for RLE batch put
+    if (config::enable_rle_batch_put_optimization) {
         // Fast path: if we're already in a repeated run with the same value,
         // we can skip the loop entirely and just add to repeat_count_.
         // This is the common case for sparse wide table compaction where

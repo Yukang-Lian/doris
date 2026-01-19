@@ -550,9 +550,10 @@ Status VerticalBlockReader::_unique_key_next_block(Block* block, bool* eof) {
     const size_t column_count = block->columns();
 
     // Try to use batch optimization for value column compaction
+    // Only use batch optimization when sparse optimization is enabled
     {
         auto* mask_iter = dynamic_cast<VerticalMaskMergeIterator*>(_vcollect_iter.get());
-        if (mask_iter != nullptr) {
+        if (mask_iter != nullptr && _use_sparse_optimization) {
             // Step 1: Batch fetch row information
             std::vector<RowBatch> batches;
             size_t actual_rows = 0;
@@ -563,20 +564,6 @@ Status VerticalBlockReader::_unique_key_next_block(Block* block, bool* eof) {
             if (actual_rows == 0) {
                 *eof = true;
                 _eof = true;
-                return Status::OK();
-            }
-
-            // If data is not sparse enough (determined from metadata), use normal batch processing
-            if (!_use_sparse_optimization) {
-                for (const auto& batch : batches) {
-                    Block* src_block = batch.block.get();
-                    for (size_t col_idx = 0; col_idx < column_count; ++col_idx) {
-                        const auto& src_col = src_block->get_by_position(col_idx).column;
-                        target_columns[col_idx]->insert_range_from(*src_col, batch.start_row,
-                                                                   batch.count);
-                    }
-                }
-                block->set_columns(std::move(target_columns));
                 return Status::OK();
             }
 
