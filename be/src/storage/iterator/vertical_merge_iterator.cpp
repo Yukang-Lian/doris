@@ -369,6 +369,11 @@ Status VerticalMergeIteratorContext::init(const StorageReadOptions& opts,
     if (sample_info != nullptr) {
         sample_info->bytes += bytes();
         sample_info->rows += rows();
+        if (rows() > 0) {
+            LOG(INFO) << "vertical compaction block sample, order: " << _order
+                      << ", block_bytes: " << bytes() << ", block_rows: " << rows()
+                      << ", per_row: " << bytes() / rows();
+        }
     }
     if (valid()) {
         RETURN_IF_ERROR(advance());
