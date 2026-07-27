@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,11 +29,14 @@
 #include <vector>
 
 #include "common/config.h"
+#include "common/defer.h"
+#include "common/lexical_util.h"
 #include "meta-service/meta_service.h"
 #include "meta-store/keys.h"
 #include "meta-store/txn_kv.h"
 #include "meta-store/txn_kv_error.h"
 #include "meta-store/versioned_value.h"
+#include "recycler/recycler.h"
 #include "resource-manager/resource_manager.h"
 #include "snapshot/snapshot_manager.h"
 
@@ -219,6 +223,34 @@ protected:
         ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
         auto [code, message] = service_->resource_mgr()->refresh_instance(instance_id_);
         ASSERT_EQ(code, MetaServiceCode::OK) << message;
+    }
+
+    Versionstamp put_auto_versioned_offset(const std::string& target_instance_id,
+                                           const TableStreamIdentityPB& identity,
+                                           int64_t partition_id, int64_t offset_tso,
+                                           bool write_latest = false) {
+        std::unique_ptr<Transaction> txn;
+        EXPECT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        TableStreamOffsetPB offset;
+        offset.set_partition_id(partition_id);
+        offset.set_state(TABLE_STREAM_OFFSET_CONSUMED);
+        offset.set_offset_tso(offset_tso);
+        const TableStreamOffsetKeyInfo key_info {target_instance_id,
+                                                 identity.base_db_id(),
+                                                 identity.base_table_id(),
+                                                 identity.stream_db_id(),
+                                                 identity.stream_id(),
+                                                 partition_id};
+        const std::string value = offset.SerializeAsString();
+        if (write_latest) {
+            txn->put(table_stream_offset_key(key_info), value);
+        }
+        txn->enable_get_versionstamp();
+        versioned_put(txn.get(), versioned::table_stream_offset_key(key_info), value);
+        EXPECT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+        Versionstamp version;
+        EXPECT_EQ(txn->get_versionstamp(&version), TxnErrorCode::TXN_OK);
+        return version;
     }
 
     std::unique_ptr<MetaServiceProxy> service_;
@@ -830,6 +862,9 @@ TEST_F(MetaServiceTableStreamTest, DropWritesTypedOperationLogInVersionedMode) {
                                  &operation_log),
               TxnErrorCode::TXN_OK);
     ASSERT_TRUE(operation_log.has_drop_index());
+    ASSERT_TRUE(operation_log.has_min_timestamp());
+    EXPECT_EQ(operation_log.min_timestamp(),
+              static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
     const DropIndexLogPB& drop_index = operation_log.drop_index();
     EXPECT_EQ(drop_index.object_type(), IndexObjectTypePB::TABLE_STREAM);
     EXPECT_EQ(drop_index.db_id(), identity_.base_db_id());
@@ -841,6 +876,134 @@ TEST_F(MetaServiceTableStreamTest, DropWritesTypedOperationLogInVersionedMode) {
     std::string value;
     EXPECT_EQ(txn->get(recycle_index_key({instance_id_, identity_.stream_id()}), &value, true),
               TxnErrorCode::TXN_KEY_NOT_FOUND);
+}
+
+TEST_F(MetaServiceTableStreamTest, DropUsesEarliestLocalVersionedOffset) {
+    const std::string source_instance_id = "table_stream_drop_source";
+    const Versionstamp source_version =
+            put_auto_versioned_offset(source_instance_id, identity_, 2001, 10);
+    set_clone_source(source_instance_id, Versionstamp(source_version.version() + 1, 0));
+    // Partition 2002 sorts after partition 2001 but contains the earliest local version.
+    const Versionstamp min_local_version =
+            put_auto_versioned_offset(instance_id_, identity_, 2002, 30);
+    put_auto_versioned_offset(instance_id_, identity_, 2001, 10);
+    put_auto_versioned_offset(instance_id_, identity_, 2001, 20);
+
+    IndexRequest request;
+    request.set_cloud_unique_id(cloud_unique_id_);
+    request.add_index_ids(identity_.stream_id());
+    request.set_db_id(identity_.base_db_id());
+    request.set_table_id(identity_.base_table_id());
+    request.set_object_type(IndexObjectTypePB::TABLE_STREAM);
+    request.set_stream_db_id(identity_.stream_db_id());
+    request.set_expiration(0);
+    IndexResponse response;
+    brpc::Controller controller;
+    service_->drop_index(&controller, &request, &response, nullptr);
+    ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    OperationLogPB operation_log;
+    Versionstamp log_version;
+    ASSERT_EQ(read_operation_log(txn.get(), versioned::log_key({instance_id_}), &log_version,
+                                 &operation_log),
+              TxnErrorCode::TXN_OK);
+    ASSERT_TRUE(operation_log.has_drop_index());
+    ASSERT_TRUE(operation_log.has_min_timestamp());
+    EXPECT_LT(source_version.version(), min_local_version.version());
+    EXPECT_EQ(operation_log.min_timestamp(), min_local_version.version());
+    EXPECT_LT(operation_log.min_timestamp(), log_version.version());
+}
+
+TEST_F(MetaServiceTableStreamTest, DropAndRecycleCloneChildOffsets) {
+    const bool old_force_immediate_recycle = config::force_immediate_recycle;
+    config::force_immediate_recycle = true;
+    DORIS_CLOUD_DEFER {
+        config::force_immediate_recycle = old_force_immediate_recycle;
+    };
+
+    const std::string source_instance_id = "table_stream_drop_recycle_source";
+    TableStreamIdentityPB local_identity = identity_;
+    TableStreamIdentityPB inherited_identity = identity_;
+    inherited_identity.set_stream_id(identity_.stream_id() + 1);
+    put_auto_versioned_offset(source_instance_id, local_identity, 2001, 90);
+    const Versionstamp source_version =
+            put_auto_versioned_offset(source_instance_id, inherited_identity, 2001, 80);
+    const Versionstamp source_snapshot = Versionstamp::next(source_version);
+    set_clone_source(source_instance_id, source_snapshot);
+    put_auto_versioned_offset(instance_id_, local_identity, 2001, 100, true);
+
+    auto drop_stream = [&](const TableStreamIdentityPB& identity) {
+        IndexRequest request;
+        request.set_cloud_unique_id(cloud_unique_id_);
+        request.add_index_ids(identity.stream_id());
+        request.set_db_id(identity.base_db_id());
+        request.set_table_id(identity.base_table_id());
+        request.set_object_type(IndexObjectTypePB::TABLE_STREAM);
+        request.set_stream_db_id(identity.stream_db_id());
+        request.set_expiration(0);
+        IndexResponse response;
+        brpc::Controller controller;
+        service_->drop_index(&controller, &request, &response, nullptr);
+        EXPECT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+    };
+    drop_stream(local_identity);
+    drop_stream(inherited_identity);
+
+    InstanceInfoPB child_instance;
+    child_instance.set_instance_id(instance_id_);
+    child_instance.set_status(InstanceInfoPB::NORMAL);
+    child_instance.set_multi_version_status(MULTI_VERSION_READ_WRITE);
+    child_instance.set_source_instance_id(source_instance_id);
+    child_instance.set_source_snapshot_id(SnapshotManager::serialize_snapshot_id(source_snapshot));
+    InstanceRecycler recycler(service_->txn_kv(), child_instance, RecyclerThreadPoolGroup {},
+                              std::make_shared<TxnLazyCommitter>(service_->txn_kv()));
+    ASSERT_EQ(recycler.init(), 0);
+    ASSERT_EQ(recycler.recycle_operation_logs(), 0);
+
+    auto key_exists = [&](std::string_view key) {
+        std::unique_ptr<Transaction> txn;
+        EXPECT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string value;
+        return txn->get(key, &value, true) == TxnErrorCode::TXN_OK;
+    };
+    EXPECT_TRUE(key_exists(recycle_index_key({instance_id_, local_identity.stream_id()})));
+    EXPECT_TRUE(key_exists(recycle_index_key({instance_id_, inherited_identity.stream_id()})));
+
+    ASSERT_EQ(recycler.recycle_indexes(), 0);
+    const auto offset_count = [&](const std::string& prefix) {
+        std::unique_ptr<Transaction> txn;
+        EXPECT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::unique_ptr<RangeGetIterator> iter;
+        EXPECT_EQ(txn->get(prefix, lexical_end(prefix), &iter, true, 0), TxnErrorCode::TXN_OK);
+        return iter->size();
+    };
+    EXPECT_EQ(offset_count(table_stream_offset_key_prefix(
+                      instance_id_, local_identity.base_db_id(), local_identity.base_table_id(),
+                      local_identity.stream_db_id(), local_identity.stream_id())),
+              0);
+    EXPECT_EQ(offset_count(versioned::table_stream_offset_key_prefix(
+                      instance_id_, local_identity.base_db_id(), local_identity.base_table_id(),
+                      local_identity.stream_db_id(), local_identity.stream_id())),
+              0);
+    EXPECT_EQ(offset_count(versioned::table_stream_offset_key_prefix(
+                      instance_id_, inherited_identity.base_db_id(),
+                      inherited_identity.base_table_id(), inherited_identity.stream_db_id(),
+                      inherited_identity.stream_id())),
+              0);
+    EXPECT_FALSE(key_exists(recycle_index_key({instance_id_, local_identity.stream_id()})));
+    EXPECT_FALSE(key_exists(recycle_index_key({instance_id_, inherited_identity.stream_id()})));
+    EXPECT_GT(offset_count(versioned::table_stream_offset_key_prefix(
+                      source_instance_id, local_identity.base_db_id(),
+                      local_identity.base_table_id(), local_identity.stream_db_id(),
+                      local_identity.stream_id())),
+              0);
+    EXPECT_GT(offset_count(versioned::table_stream_offset_key_prefix(
+                      source_instance_id, inherited_identity.base_db_id(),
+                      inherited_identity.base_table_id(), inherited_identity.stream_db_id(),
+                      inherited_identity.stream_id())),
+              0);
 }
 
 } // namespace doris::cloud

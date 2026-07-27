@@ -18,7 +18,9 @@
 #include <fmt/format.h>
 #include <gen_cpp/cloud.pb.h>
 
+#include <algorithm>
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -136,6 +138,34 @@ static TxnErrorCode table_stream_offset_exists(Transaction* txn, const std::stri
         return err;
     }
     return it->has_next() ? TxnErrorCode::TXN_OK : TxnErrorCode::TXN_KEY_NOT_FOUND;
+}
+
+static TxnErrorCode get_table_stream_min_local_offset_version(
+        Transaction* txn, const std::string& instance_id, int64_t base_db_id,
+        int64_t base_table_id, int64_t stream_db_id, int64_t stream_id,
+        Versionstamp* min_version) {
+    // Stream recycling removes only the current instance's offset prefix. Keep this range read in
+    // the DROP transaction so an offset write committed before this transaction cannot escape the
+    // min_timestamp calculation. A later recycle index rejects writes after it is materialized.
+    const std::string begin = versioned::table_stream_offset_key_prefix(
+            instance_id, base_db_id, base_table_id, stream_db_id, stream_id);
+    FullRangeGetOptions options;
+    options.snapshot = false;
+    options.prefetch = true;
+    auto iter = txn->full_range_get(begin, lexical_end(begin), options);
+    *min_version = Versionstamp(std::numeric_limits<int64_t>::max(), 0);
+    for (auto kv = iter->next(); kv.has_value(); kv = iter->next()) {
+        std::string_view key = kv->first;
+        Versionstamp version;
+        if (!decode_versioned_key(&key, &version)) {
+            LOG_WARNING("failed to decode versioned Table Stream offset key")
+                    .tag("key", hex(kv->first))
+                    .tag("stream_id", stream_id);
+            return TxnErrorCode::TXN_INVALID_DATA;
+        }
+        *min_version = std::min(*min_version, version);
+    }
+    return iter->is_valid() ? TxnErrorCode::TXN_OK : iter->error_code();
 }
 
 static bool validate_table_stream_partition_request(const PartitionRequest* request,
@@ -656,6 +686,7 @@ void MetaServiceImpl::drop_index(::google::protobuf::RpcController* controller,
     }
 
     CloneChainReader reader(instance_id, resource_mgr_.get());
+    Versionstamp table_stream_min_offset_version(std::numeric_limits<int64_t>::max(), 0);
     for (auto index_id : request->index_ids()) {
         auto key = recycle_index_key({instance_id, index_id});
         std::string val;
@@ -663,7 +694,18 @@ void MetaServiceImpl::drop_index(::google::protobuf::RpcController* controller,
         if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) { // UNKNOWN
             if (is_versioned_write) {
                 drop_index_log.add_index_ids(index_id);
-                if (is_versioned_read && !is_table_stream) {
+                if (is_table_stream) {
+                    err = get_table_stream_min_local_offset_version(
+                            txn.get(), instance_id, request->db_id(), request->table_id(),
+                            request->stream_db_id(), index_id, &table_stream_min_offset_version);
+                    if (err != TxnErrorCode::TXN_OK) {
+                        code = cast_as<ErrCategory::READ>(err);
+                        msg = fmt::format(
+                                "failed to read local versioned Table Stream offsets, err={}", err);
+                        LOG_WARNING(msg).tag("stream_id", index_id);
+                        return;
+                    }
+                } else if (is_versioned_read) {
                     // Read the index version, to build the operation log visible version range.
                     err = reader.is_index_exists(txn.get(), index_id);
                     if (err != TxnErrorCode::TXN_OK && err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
@@ -727,7 +769,9 @@ void MetaServiceImpl::drop_index(::google::protobuf::RpcController* controller,
     if (drop_index_log.index_ids_size() > 0 && is_versioned_write) {
         std::string operation_log_key = versioned::log_key({instance_id});
         OperationLogPB operation_log;
-        if (is_versioned_read && !is_table_stream) {
+        if (is_table_stream) {
+            operation_log.set_min_timestamp(table_stream_min_offset_version.version());
+        } else if (is_versioned_read) {
             operation_log.set_min_timestamp(reader.min_read_version());
         }
         operation_log.mutable_drop_index()->Swap(&drop_index_log);
