@@ -38,7 +38,7 @@
 namespace doris::cloud {
 namespace {
 
-TableStreamReadResult validate_request(const GetTableStreamReadStateRequest& request) {
+TableStreamReadResult validate_request(const GetTableStreamOffsetRequest& request) {
     std::unordered_set<int64_t> stream_ids;
     for (const TableStreamPartitionSetPB& binding : request.bindings()) {
         if (!binding.has_identity() || !is_valid_table_stream_identity(binding.identity()) ||
@@ -119,7 +119,7 @@ TableStreamReadResult fill_partition_read_state(const TableStreamIdentityPB& ide
 
 TableStreamReadResult read_bindings(const TableStreamMetadataReader& reader,
                                     const std::vector<TableStreamPartitionSetPB>& bindings,
-                                    GetTableStreamReadStateResponse* response) {
+                                    GetTableStreamOffsetResponse* response) {
     TableStreamPartitionVersionMap versions;
     TableStreamReadResult result = reader.read_and_validate_partitions(
             bindings, TableStreamReadIntent::SNAPSHOT, &versions);
@@ -160,11 +160,11 @@ TableStreamReadResult read_bindings(const TableStreamMetadataReader& reader,
 
 } // namespace
 
-void MetaServiceImpl::get_table_stream_read_state(::google::protobuf::RpcController* controller,
-                                                  const GetTableStreamReadStateRequest* request,
-                                                  GetTableStreamReadStateResponse* response,
-                                                  ::google::protobuf::Closure* done) {
-    RPC_PREPROCESS(get_table_stream_read_state, get);
+void MetaServiceImpl::get_table_stream_offset(::google::protobuf::RpcController* controller,
+                                              const GetTableStreamOffsetRequest* request,
+                                              GetTableStreamOffsetResponse* response,
+                                              ::google::protobuf::Closure* done) {
+    RPC_PREPROCESS(get_table_stream_offset, get);
     if (!request->has_cloud_unique_id() || request->cloud_unique_id().empty()) {
         code = MetaServiceCode::INVALID_ARGUMENT;
         msg = "cloud_unique_id not set";
@@ -188,7 +188,7 @@ void MetaServiceImpl::get_table_stream_read_state(::google::protobuf::RpcControl
         msg = "empty instance_id";
         return;
     }
-    RPC_RATE_LIMIT(get_table_stream_read_state)
+    RPC_RATE_LIMIT(get_table_stream_offset)
 
     TxnErrorCode err = txn_kv_->create_txn(&txn);
     if (err != TxnErrorCode::TXN_OK) {
@@ -217,7 +217,7 @@ void MetaServiceImpl::get_table_stream_read_state(::google::protobuf::RpcControl
         return;
     }
 
-    GetTableStreamReadStateResponse read_response;
+    GetTableStreamOffsetResponse read_response;
     TableStreamReadResult read_result = read_bindings(reader, bindings, &read_response);
     if (!read_result.ok()) {
         code = read_result.code;

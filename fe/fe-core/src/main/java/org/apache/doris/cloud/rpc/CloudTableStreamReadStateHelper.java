@@ -35,8 +35,8 @@ public final class CloudTableStreamReadStateHelper {
     public static Map<Cloud.TableStreamIdentityPB, Map<Long, Cloud.TableStreamPartitionReadStatePB>>
             getReadStates(Map<Cloud.TableStreamIdentityPB, Set<Long>> requestedPartitions)
             throws UserException {
-        Cloud.GetTableStreamReadStateRequest.Builder request =
-                Cloud.GetTableStreamReadStateRequest.newBuilder()
+        Cloud.GetTableStreamOffsetRequest.Builder request =
+                Cloud.GetTableStreamOffsetRequest.newBuilder()
                         .setCloudUniqueId(Config.cloud_unique_id)
                         .setRequestIp(FrontendOptions.getLocalHostAddressCached());
         requestedPartitions.forEach((identity, partitionIds) -> request.addBindings(
@@ -44,9 +44,9 @@ public final class CloudTableStreamReadStateHelper {
                         .setIdentity(identity)
                         .addAllPartitionIds(partitionIds)));
 
-        Cloud.GetTableStreamReadStateResponse response;
+        Cloud.GetTableStreamOffsetResponse response;
         try {
-            response = MetaServiceProxy.getInstance().getTableStreamReadState(request.build());
+            response = MetaServiceProxy.getInstance().getTableStreamOffset(request.build());
         } catch (RpcException e) {
             throw new UserException("Failed to get Cloud Table Stream read state: " + e.getMessage(), e);
         }
@@ -59,7 +59,7 @@ public final class CloudTableStreamReadStateHelper {
 
     private static Map<Cloud.TableStreamIdentityPB, Map<Long, Cloud.TableStreamPartitionReadStatePB>>
             validateResponse(Map<Cloud.TableStreamIdentityPB, Set<Long>> requestedPartitions,
-                    Cloud.GetTableStreamReadStateResponse response) throws UserException {
+                    Cloud.GetTableStreamOffsetResponse response) throws UserException {
         Map<Cloud.TableStreamIdentityPB, Map<Long, Cloud.TableStreamPartitionReadStatePB>> readStates =
                 new LinkedHashMap<>();
         for (Cloud.TableStreamReadBindingResultPB binding : response.getBindingsList()) {

@@ -419,7 +419,7 @@ public class InsertIntoTableCommandTableStreamTest extends TestWithFeService {
                 .setStreamDbId(db.getId())
                 .setStreamId(stream.getId())
                 .build();
-        Cloud.GetTableStreamReadStateResponse response = Cloud.GetTableStreamReadStateResponse.newBuilder()
+        Cloud.GetTableStreamOffsetResponse response = Cloud.GetTableStreamOffsetResponse.newBuilder()
                 .setStatus(Cloud.MetaServiceResponseStatus.newBuilder().setCode(Cloud.MetaServiceCode.OK))
                 .addBindings(Cloud.TableStreamReadBindingResultPB.newBuilder()
                         .setIdentity(identity)
@@ -448,7 +448,7 @@ public class InsertIntoTableCommandTableStreamTest extends TestWithFeService {
             Config.meta_service_endpoint = "127.0.0.1:20121";
             try (MockedStatic<MetaServiceProxy> mockedProxy = Mockito.mockStatic(MetaServiceProxy.class)) {
                 mockedProxy.when(MetaServiceProxy::getInstance).thenReturn(proxy);
-                Mockito.when(proxy.getTableStreamReadState(Mockito.any())).thenReturn(response);
+                Mockito.when(proxy.getTableStreamOffset(Mockito.any())).thenReturn(response);
 
                 new ResolveCloudTableStreamReadState().rewriteRoot(analyzedPlan, null);
                 List<TableStreamUpdateInfo> streamUpdateInfos = StreamConsumptionInfoExtractor.extract(analyzedPlan);
@@ -465,9 +465,9 @@ public class InsertIntoTableCommandTableStreamTest extends TestWithFeService {
                 Assertions.assertEquals(100, partitionUpdate.getExpectedOffsetTso());
                 Assertions.assertEquals(130, partitionUpdate.getNextOffsetTso());
 
-                ArgumentCaptor<Cloud.GetTableStreamReadStateRequest> requestCaptor =
-                        ArgumentCaptor.forClass(Cloud.GetTableStreamReadStateRequest.class);
-                Mockito.verify(proxy).getTableStreamReadState(requestCaptor.capture());
+                ArgumentCaptor<Cloud.GetTableStreamOffsetRequest> requestCaptor =
+                        ArgumentCaptor.forClass(Cloud.GetTableStreamOffsetRequest.class);
+                Mockito.verify(proxy).getTableStreamOffset(requestCaptor.capture());
                 Assertions.assertEquals(1, requestCaptor.getValue().getBindingsCount());
                 Assertions.assertEquals(List.of(partitionId),
                         requestCaptor.getValue().getBindings(0).getPartitionIdsList());
@@ -514,10 +514,10 @@ public class InsertIntoTableCommandTableStreamTest extends TestWithFeService {
             connectContext.getSessionVariable().enableCTEMaterialize = false;
             try (MockedStatic<MetaServiceProxy> mockedProxy = Mockito.mockStatic(MetaServiceProxy.class)) {
                 mockedProxy.when(MetaServiceProxy::getInstance).thenReturn(proxy);
-                Mockito.when(proxy.getTableStreamReadState(Mockito.any())).thenAnswer(invocation -> {
-                    Cloud.GetTableStreamReadStateRequest request = invocation.getArgument(0);
-                    Cloud.GetTableStreamReadStateResponse.Builder response =
-                            Cloud.GetTableStreamReadStateResponse.newBuilder()
+                Mockito.when(proxy.getTableStreamOffset(Mockito.any())).thenAnswer(invocation -> {
+                    Cloud.GetTableStreamOffsetRequest request = invocation.getArgument(0);
+                    Cloud.GetTableStreamOffsetResponse.Builder response =
+                            Cloud.GetTableStreamOffsetResponse.newBuilder()
                                     .setStatus(Cloud.MetaServiceResponseStatus.newBuilder()
                                             .setCode(Cloud.MetaServiceCode.OK));
                     for (Cloud.TableStreamPartitionSetPB binding : request.getBindingsList()) {
@@ -557,9 +557,9 @@ public class InsertIntoTableCommandTableStreamTest extends TestWithFeService {
                 checker.preMvRewrite();
                 Assertions.assertTrue(checker.getCascadesContext().getStatementContext().isPreMvRewritten());
 
-                ArgumentCaptor<Cloud.GetTableStreamReadStateRequest> requestCaptor =
-                        ArgumentCaptor.forClass(Cloud.GetTableStreamReadStateRequest.class);
-                Mockito.verify(proxy, Mockito.times(1)).getTableStreamReadState(requestCaptor.capture());
+                ArgumentCaptor<Cloud.GetTableStreamOffsetRequest> requestCaptor =
+                        ArgumentCaptor.forClass(Cloud.GetTableStreamOffsetRequest.class);
+                Mockito.verify(proxy, Mockito.times(1)).getTableStreamOffset(requestCaptor.capture());
                 Assertions.assertEquals(1, requestCaptor.getValue().getBindingsCount());
                 Assertions.assertEquals(Set.of(p1, p2),
                         new HashSet<>(requestCaptor.getValue().getBindings(0).getPartitionIdsList()));
@@ -588,10 +588,10 @@ public class InsertIntoTableCommandTableStreamTest extends TestWithFeService {
             Config.meta_service_endpoint = "127.0.0.1:20121";
             try (MockedStatic<MetaServiceProxy> mockedProxy = Mockito.mockStatic(MetaServiceProxy.class)) {
                 mockedProxy.when(MetaServiceProxy::getInstance).thenReturn(proxy);
-                Mockito.when(proxy.getTableStreamReadState(Mockito.any())).thenAnswer(invocation -> {
-                    Cloud.GetTableStreamReadStateRequest request = invocation.getArgument(0);
-                    Cloud.GetTableStreamReadStateResponse.Builder response =
-                            Cloud.GetTableStreamReadStateResponse.newBuilder()
+                Mockito.when(proxy.getTableStreamOffset(Mockito.any())).thenAnswer(invocation -> {
+                    Cloud.GetTableStreamOffsetRequest request = invocation.getArgument(0);
+                    Cloud.GetTableStreamOffsetResponse.Builder response =
+                            Cloud.GetTableStreamOffsetResponse.newBuilder()
                                     .setStatus(Cloud.MetaServiceResponseStatus.newBuilder()
                                             .setCode(Cloud.MetaServiceCode.OK));
                     for (Cloud.TableStreamPartitionSetPB binding : request.getBindingsList()) {
@@ -624,9 +624,9 @@ public class InsertIntoTableCommandTableStreamTest extends TestWithFeService {
                 CloudOlapTableStreamUpdate update = (CloudOlapTableStreamUpdate) updates.get(0).getUpdate();
                 Assertions.assertEquals(Set.of(p1), update.getPartitionUpdates().keySet());
 
-                ArgumentCaptor<Cloud.GetTableStreamReadStateRequest> requestCaptor =
-                        ArgumentCaptor.forClass(Cloud.GetTableStreamReadStateRequest.class);
-                Mockito.verify(proxy).getTableStreamReadState(requestCaptor.capture());
+                ArgumentCaptor<Cloud.GetTableStreamOffsetRequest> requestCaptor =
+                        ArgumentCaptor.forClass(Cloud.GetTableStreamOffsetRequest.class);
+                Mockito.verify(proxy).getTableStreamOffset(requestCaptor.capture());
                 Assertions.assertEquals(1, requestCaptor.getValue().getBindingsCount());
                 Assertions.assertEquals(Set.of(p1, p2),
                         new HashSet<>(requestCaptor.getValue().getBindings(0).getPartitionIdsList()));
@@ -658,7 +658,7 @@ public class InsertIntoTableCommandTableStreamTest extends TestWithFeService {
                 checker.rewrite();
 
                 Assertions.assertTrue(StreamConsumptionInfoExtractor.extract(analyzedPlan).isEmpty());
-                Mockito.verify(proxy, Mockito.never()).getTableStreamReadState(Mockito.any());
+                Mockito.verify(proxy, Mockito.never()).getTableStreamOffset(Mockito.any());
             }
         } finally {
             Config.cloud_unique_id = previousCloudUniqueId;

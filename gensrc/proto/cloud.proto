@@ -1492,7 +1492,7 @@ message PartitionResponse {
     optional int64 table_version = 2;
 }
 
-message GetTableStreamReadStateRequest {
+message GetTableStreamOffsetRequest {
     optional string cloud_unique_id = 1;
     repeated TableStreamPartitionSetPB bindings = 2;
     optional string request_ip = 3;
@@ -1512,7 +1512,7 @@ message TableStreamReadBindingResultPB {
     repeated TableStreamPartitionReadStatePB partition_states = 2;
 }
 
-message GetTableStreamReadStateResponse {
+message GetTableStreamOffsetResponse {
     optional MetaServiceResponseStatus status = 1;
     repeated TableStreamReadBindingResultPB bindings = 2;
 }
@@ -2388,7 +2388,7 @@ service MetaService {
     rpc get_prepare_txn_by_coordinator(GetPrepareTxnByCoordinatorRequest) returns (GetPrepareTxnByCoordinatorResponse);
 
     rpc get_version(GetVersionRequest) returns (GetVersionResponse);
-    rpc get_table_stream_read_state(GetTableStreamReadStateRequest) returns (GetTableStreamReadStateResponse);
+    rpc get_table_stream_offset(GetTableStreamOffsetRequest) returns (GetTableStreamOffsetResponse);
     rpc create_tablets(CreateTabletsRequest) returns (CreateTabletsResponse);
     rpc update_tablet(UpdateTabletRequest) returns (UpdateTabletResponse);
 

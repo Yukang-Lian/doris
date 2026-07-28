@@ -125,21 +125,21 @@ protected:
         }
     }
 
-    GetTableStreamReadStateResponse get_read_state(const std::vector<int64_t>& partitions) {
-        GetTableStreamReadStateRequest request;
+    GetTableStreamOffsetResponse get_read_state(const std::vector<int64_t>& partitions) {
+        GetTableStreamOffsetRequest request;
         request.set_cloud_unique_id(cloud_unique_id_);
         auto* binding = request.add_bindings();
         binding->mutable_identity()->CopyFrom(identity_);
         for (int64_t partition_id : partitions) {
             binding->add_partition_ids(partition_id);
         }
-        GetTableStreamReadStateResponse response;
+        GetTableStreamOffsetResponse response;
         brpc::Controller controller;
-        service_->get_table_stream_read_state(&controller, &request, &response, nullptr);
+        service_->get_table_stream_offset(&controller, &request, &response, nullptr);
         return response;
     }
 
-    GetTableStreamReadStateResponse get_read_state(std::initializer_list<int64_t> partitions) {
+    GetTableStreamOffsetResponse get_read_state(std::initializer_list<int64_t> partitions) {
         return get_read_state(std::vector<int64_t>(partitions));
     }
 
@@ -235,12 +235,9 @@ protected:
         offset.set_partition_id(partition_id);
         offset.set_state(TABLE_STREAM_OFFSET_CONSUMED);
         offset.set_offset_tso(offset_tso);
-        const TableStreamOffsetKeyInfo key_info {target_instance_id,
-                                                 identity.base_db_id(),
-                                                 identity.base_table_id(),
-                                                 identity.stream_db_id(),
-                                                 identity.stream_id(),
-                                                 partition_id};
+        const TableStreamOffsetKeyInfo key_info {target_instance_id,       identity.base_db_id(),
+                                                 identity.base_table_id(), identity.stream_db_id(),
+                                                 identity.stream_id(),     partition_id};
         const std::string value = offset.SerializeAsString();
         if (write_latest) {
             txn->put(table_stream_offset_key(key_info), value);
@@ -268,7 +265,7 @@ TEST_F(MetaServiceTableStreamTest, ReadLatestAndUnknownOffsets) {
     put_latest_partition_state(txn.get(), 2002, 9, 140, std::nullopt);
     ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
 
-    GetTableStreamReadStateResponse response = get_read_state({2001, 2002});
+    GetTableStreamOffsetResponse response = get_read_state({2001, 2002});
     ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
     ASSERT_EQ(response.bindings_size(), 1);
     ASSERT_EQ(response.bindings(0).partition_states_size(), 2);
@@ -296,7 +293,7 @@ TEST_F(MetaServiceTableStreamTest, ReadVersionedState) {
     put_versioned_partition_state(txn.get(), 2001, 18, 230, 200);
     ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
 
-    GetTableStreamReadStateResponse response = get_read_state({2001});
+    GetTableStreamOffsetResponse response = get_read_state({2001});
     ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
     ASSERT_EQ(response.bindings_size(), 1);
     ASSERT_EQ(response.bindings(0).partition_states_size(), 1);
@@ -350,7 +347,7 @@ TEST_F(MetaServiceTableStreamTest, ReadVersionedStateFromCloneChainInBatch) {
     put_offset(instance_id_, 2002, Versionstamp(200, 0), 802);
     ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
 
-    GetTableStreamReadStateResponse response = get_read_state(partition_ids);
+    GetTableStreamOffsetResponse response = get_read_state(partition_ids);
     ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
     ASSERT_EQ(response.bindings(0).partition_states_size(), partition_ids.size());
     EXPECT_EQ(response.bindings(0).partition_states(0).offset_tso(), 701);
@@ -373,7 +370,7 @@ TEST_F(MetaServiceTableStreamTest, ReadLargePartitionBatch) {
     }
     ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
 
-    GetTableStreamReadStateResponse response = get_read_state(partition_ids);
+    GetTableStreamOffsetResponse response = get_read_state(partition_ids);
     ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
     ASSERT_EQ(response.bindings(0).partition_states_size(), kPartitionCount);
     EXPECT_EQ(response.bindings(0).partition_states(0).partition_id(), partition_ids.front());
@@ -404,7 +401,7 @@ TEST_F(MetaServiceTableStreamTest, ReadMultipleBindingsInBatch) {
     versioned_put(txn.get(), versioned::partition_version_key({instance_id_, kPartitionId}),
                   Versionstamp(21, 0), version.SerializeAsString());
 
-    GetTableStreamReadStateRequest request;
+    GetTableStreamOffsetRequest request;
     request.set_cloud_unique_id(cloud_unique_id_);
     for (int i = 0; i < kBindingCount; ++i) {
         int64_t stream_id = identity_.stream_id() + i;
@@ -415,9 +412,9 @@ TEST_F(MetaServiceTableStreamTest, ReadMultipleBindingsInBatch) {
     }
     ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
 
-    GetTableStreamReadStateResponse response;
+    GetTableStreamOffsetResponse response;
     brpc::Controller controller;
-    service_->get_table_stream_read_state(&controller, &request, &response, nullptr);
+    service_->get_table_stream_offset(&controller, &request, &response, nullptr);
     ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
     ASSERT_EQ(response.bindings_size(), kBindingCount);
     for (const TableStreamReadBindingResultPB& binding : response.bindings()) {
@@ -433,7 +430,7 @@ TEST_F(MetaServiceTableStreamTest, ReadWriteOnlyState) {
     put_latest_partition_state(txn.get(), 2001, 28, 330, 300);
     ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
 
-    GetTableStreamReadStateResponse response = get_read_state({2001});
+    GetTableStreamOffsetResponse response = get_read_state({2001});
     ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
     ASSERT_EQ(response.bindings_size(), 1);
     ASSERT_EQ(response.bindings(0).partition_states_size(), 1);
@@ -445,15 +442,15 @@ TEST_F(MetaServiceTableStreamTest, ReadWriteOnlyState) {
 }
 
 TEST_F(MetaServiceTableStreamTest, RejectDuplicateBindingsAndPartitions) {
-    GetTableStreamReadStateRequest request;
+    GetTableStreamOffsetRequest request;
     request.set_cloud_unique_id(cloud_unique_id_);
     auto* binding = request.add_bindings();
     binding->mutable_identity()->CopyFrom(identity_);
     binding->add_partition_ids(2001);
     binding->add_partition_ids(2001);
-    GetTableStreamReadStateResponse response;
+    GetTableStreamOffsetResponse response;
     brpc::Controller controller;
-    service_->get_table_stream_read_state(&controller, &request, &response, nullptr);
+    service_->get_table_stream_offset(&controller, &request, &response, nullptr);
     EXPECT_EQ(response.status().code(), MetaServiceCode::INVALID_ARGUMENT);
 
     request.mutable_bindings()->Clear();
@@ -464,7 +461,7 @@ TEST_F(MetaServiceTableStreamTest, RejectDuplicateBindingsAndPartitions) {
     }
     response.Clear();
     brpc::Controller second_controller;
-    service_->get_table_stream_read_state(&second_controller, &request, &response, nullptr);
+    service_->get_table_stream_offset(&second_controller, &request, &response, nullptr);
     EXPECT_EQ(response.status().code(), MetaServiceCode::INVALID_ARGUMENT);
 }
 
@@ -478,7 +475,7 @@ TEST_F(MetaServiceTableStreamTest, RejectEnabledModeAndRecyclingStream) {
     txn->put(instance_key({instance_id_}), instance.SerializeAsString());
     ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
 
-    GetTableStreamReadStateResponse response = get_read_state({2001});
+    GetTableStreamOffsetResponse response = get_read_state({2001});
     EXPECT_EQ(response.status().code(), MetaServiceCode::INVALID_ARGUMENT);
 
     set_multi_version_status(MULTI_VERSION_DISABLED);
@@ -994,11 +991,11 @@ TEST_F(MetaServiceTableStreamTest, DropAndRecycleCloneChildOffsets) {
               0);
     EXPECT_FALSE(key_exists(recycle_index_key({instance_id_, local_identity.stream_id()})));
     EXPECT_FALSE(key_exists(recycle_index_key({instance_id_, inherited_identity.stream_id()})));
-    EXPECT_GT(offset_count(versioned::table_stream_offset_key_prefix(
-                      source_instance_id, local_identity.base_db_id(),
-                      local_identity.base_table_id(), local_identity.stream_db_id(),
-                      local_identity.stream_id())),
-              0);
+    EXPECT_GT(
+            offset_count(versioned::table_stream_offset_key_prefix(
+                    source_instance_id, local_identity.base_db_id(), local_identity.base_table_id(),
+                    local_identity.stream_db_id(), local_identity.stream_id())),
+            0);
     EXPECT_GT(offset_count(versioned::table_stream_offset_key_prefix(
                       source_instance_id, inherited_identity.base_db_id(),
                       inherited_identity.base_table_id(), inherited_identity.stream_db_id(),

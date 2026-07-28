@@ -73,12 +73,12 @@ public class CloudTableStreamConsumptionTest extends TestWithFeService {
         MetaServiceProxy proxy = Mockito.mock(MetaServiceProxy.class);
         try (MockedStatic<MetaServiceProxy> mockedProxy = Mockito.mockStatic(MetaServiceProxy.class)) {
             mockedProxy.when(MetaServiceProxy::getInstance).thenReturn(proxy);
-            Mockito.when(proxy.getTableStreamReadState(Mockito.any())).thenAnswer(invocation -> {
-                Cloud.GetTableStreamReadStateRequest request = invocation.getArgument(0);
+            Mockito.when(proxy.getTableStreamOffset(Mockito.any())).thenAnswer(invocation -> {
+                Cloud.GetTableStreamOffsetRequest request = invocation.getArgument(0);
                 Assertions.assertEquals(1, request.getBindingsCount());
                 Assertions.assertEquals(Set.of(p1, p2),
                         new HashSet<>(request.getBindings(0).getPartitionIdsList()));
-                return Cloud.GetTableStreamReadStateResponse.newBuilder()
+                return Cloud.GetTableStreamOffsetResponse.newBuilder()
                         .setStatus(Cloud.MetaServiceResponseStatus.newBuilder()
                                 .setCode(Cloud.MetaServiceCode.OK))
                         .addBindings(Cloud.TableStreamReadBindingResultPB.newBuilder()

@@ -109,17 +109,9 @@ static bool validate_table_stream_index_request(const IndexRequest* request, Met
     return true;
 }
 
+template <typename Request>
 static bool table_stream_recycle_index_matches(const RecycleIndexPB& recycle_index,
-                                               const IndexRequest& request) {
-    return recycle_index.state() == RecycleIndexPB::PREPARED &&
-           recycle_index.object_type() == IndexObjectTypePB::TABLE_STREAM &&
-           recycle_index.has_db_id() && recycle_index.db_id() == request.db_id() &&
-           recycle_index.table_id() == request.table_id() && recycle_index.has_stream_db_id() &&
-           recycle_index.stream_db_id() == request.stream_db_id();
-}
-
-static bool table_stream_recycle_index_matches(const RecycleIndexPB& recycle_index,
-                                               const PartitionRequest& request) {
+                                               const Request& request) {
     return recycle_index.state() == RecycleIndexPB::PREPARED &&
            recycle_index.object_type() == IndexObjectTypePB::TABLE_STREAM &&
            recycle_index.has_db_id() && recycle_index.db_id() == request.db_id() &&
@@ -137,13 +129,14 @@ static TxnErrorCode table_stream_offset_exists(Transaction* txn, const std::stri
     if (err != TxnErrorCode::TXN_OK) {
         return err;
     }
+    // One returned key is sufficient for existence. `more()` only means that additional
+    // partition offsets remain in the range.
     return it->has_next() ? TxnErrorCode::TXN_OK : TxnErrorCode::TXN_KEY_NOT_FOUND;
 }
 
 static TxnErrorCode get_table_stream_min_local_offset_version(
-        Transaction* txn, const std::string& instance_id, int64_t base_db_id,
-        int64_t base_table_id, int64_t stream_db_id, int64_t stream_id,
-        Versionstamp* min_version) {
+        Transaction* txn, const std::string& instance_id, int64_t base_db_id, int64_t base_table_id,
+        int64_t stream_db_id, int64_t stream_id, Versionstamp* min_version) {
     // Stream recycling removes only the current instance's offset prefix. Keep this range read in
     // the DROP transaction so an offset write committed before this transaction cannot escape the
     // min_timestamp calculation. A later recycle index rejects writes after it is materialized.
@@ -973,6 +966,206 @@ void MetaServiceImpl::commit_partition(::google::protobuf::RpcController* contro
     }
 }
 
+void MetaServiceImpl::commit_table_stream_partition_internal(
+        Transaction* txn, const PartitionRequest* request, const std::string& instance_id,
+        const std::vector<int64_t>& partition_ids, MetaServiceCode& code, std::string& msg) {
+    MultiVersionStatus multi_version_status;
+    TableStreamReadResult status_result = read_table_stream_multi_version_status(
+            txn, instance_id, TableStreamReadIntent::CONFLICT, &multi_version_status);
+    if (!status_result.ok()) {
+        code = status_result.code;
+        msg = std::move(status_result.message);
+        return;
+    }
+    const bool is_versioned_write = is_table_stream_versioned_write(multi_version_status);
+    const int64_t stream_id = request->index_ids(0);
+
+    std::string recycle_index_val;
+    TxnErrorCode err = txn->get(recycle_index_key({instance_id, stream_id}), &recycle_index_val);
+    const bool create_in_progress = err == TxnErrorCode::TXN_OK;
+    if (err != TxnErrorCode::TXN_OK && err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        code = cast_as<ErrCategory::READ>(err);
+        msg = fmt::format("failed to read table stream recycle index, err={}", err);
+        return;
+    }
+    RecycleIndexPB recycle_index;
+    if (create_in_progress) {
+        if (!recycle_index.ParseFromString(recycle_index_val)) {
+            code = MetaServiceCode::PROTOBUF_PARSE_ERR;
+            msg = "malformed table stream recycle index value";
+            return;
+        }
+        if (!table_stream_recycle_index_matches(recycle_index, *request)) {
+            const std::string prepared_base_db_id =
+                    recycle_index.has_db_id() ? std::to_string(recycle_index.db_id()) : "<unset>";
+            const std::string prepared_stream_db_id =
+                    recycle_index.has_stream_db_id() ? std::to_string(recycle_index.stream_db_id())
+                                                     : "<unset>";
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            msg = fmt::format(
+                    "cannot initialize Table Stream offsets for stream_id={}: prepared metadata "
+                    "(state={}, object_type={}, base_db_id={}, base_table_id={}, stream_db_id={}) "
+                    "conflicts with request (base_db_id={}, base_table_id={}, stream_db_id={}); "
+                    "the CREATE STREAM request is stale or the metadata is inconsistent",
+                    stream_id, RecycleIndexPB::State_Name(recycle_index.state()),
+                    recycle_index.object_type() == IndexObjectTypePB::TABLE_STREAM
+                            ? "TABLE_STREAM"
+                            : "MATERIALIZED_INDEX",
+                    prepared_base_db_id, recycle_index.table_id(), prepared_stream_db_id,
+                    request->db_id(), request->table_id(), request->stream_db_id());
+            return;
+        }
+    }
+
+    std::unordered_map<int64_t, const TableStreamOffsetPB*> offsets;
+    offsets.reserve(request->table_stream_offsets_size());
+    for (const auto& offset : request->table_stream_offsets()) {
+        offsets.emplace(offset.partition_id(), &offset);
+    }
+
+    TableStreamIdentityPB identity;
+    identity.set_base_db_id(request->db_id());
+    identity.set_base_table_id(request->table_id());
+    identity.set_stream_db_id(request->stream_db_id());
+    identity.set_stream_id(stream_id);
+
+    TableStreamPartitionSetPB binding;
+    binding.mutable_identity()->CopyFrom(identity);
+    for (int64_t partition_id : partition_ids) {
+        binding.add_partition_ids(partition_id);
+    }
+    const std::vector<TableStreamPartitionSetPB> bindings {binding};
+
+    CloneChainReader clone_chain_reader(instance_id, resource_mgr_.get());
+    TableStreamMetadataReader metadata_reader(txn, instance_id, multi_version_status,
+                                              &clone_chain_reader);
+    if (!create_in_progress) {
+        TableStreamOffsetMap committed_offsets;
+        TableStreamReadResult read_result = metadata_reader.read_latest_offsets(
+                bindings, TableStreamReadIntent::CONFLICT, &committed_offsets);
+        if (!read_result.ok()) {
+            code = read_result.code;
+            msg = std::move(read_result.message);
+            return;
+        }
+        const auto stream_it = committed_offsets.find(stream_id);
+        for (int64_t partition_id : partition_ids) {
+            if (stream_it == committed_offsets.end() || !stream_it->second.contains(partition_id)) {
+                code = MetaServiceCode::INVALID_ARGUMENT;
+                msg = fmt::format("table stream create is not in progress and offset {} is missing",
+                                  partition_id);
+                return;
+            }
+        }
+        return;
+    }
+
+    TableStreamPartitionVersionMap source_versions;
+    TableStreamReadResult read_result = metadata_reader.read_and_validate_partitions(
+            bindings, TableStreamReadIntent::CONFLICT, &source_versions);
+    if (!read_result.ok()) {
+        code = read_result.code;
+        msg = std::move(read_result.message);
+        return;
+    }
+
+    TableStreamOffsetMap latest_offsets;
+    read_result = metadata_reader.read_latest_offsets(bindings, TableStreamReadIntent::CONFLICT,
+                                                      &latest_offsets);
+    if (!read_result.ok()) {
+        code = read_result.code;
+        msg = std::move(read_result.message);
+        return;
+    }
+
+    TableStreamOffsetMap versioned_offsets;
+    if (is_versioned_write) {
+        read_result = metadata_reader.read_local_versioned_offsets(
+                bindings, TableStreamReadIntent::CONFLICT, &versioned_offsets);
+        if (!read_result.ok()) {
+            code = read_result.code;
+            msg = std::move(read_result.message);
+            return;
+        }
+    }
+
+    size_t num_writes = 0;
+    for (int64_t partition_id : partition_ids) {
+        auto offset_it = offsets.find(partition_id);
+        DCHECK(offset_it != offsets.end());
+        const TableStreamOffsetPB& offset = *offset_it->second;
+
+        const auto& stream_versions = source_versions.at(stream_id);
+        auto source_version_it = stream_versions.find(partition_id);
+        DCHECK(source_version_it != stream_versions.end());
+        const VersionPB& source_version = source_version_it->second;
+        if (offset.offset_tso() > source_version.visible_tso()) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            msg = fmt::format("initial offset exceeds visible TSO for partition {}", partition_id);
+            return;
+        }
+
+        std::string offset_val;
+        if (!offset.SerializeToString(&offset_val)) {
+            code = MetaServiceCode::PROTOBUF_SERIALIZE_ERR;
+            msg = "failed to serialize table stream offset";
+            return;
+        }
+
+        TableStreamOffsetKeyInfo offset_key_info {instance_id,         request->db_id(),
+                                                  request->table_id(), request->stream_db_id(),
+                                                  stream_id,           partition_id};
+        const std::string latest_offset_key = table_stream_offset_key(offset_key_info);
+        const TableStreamOffsetPB* existing_latest_offset = nullptr;
+        const auto latest_stream_it = latest_offsets.find(stream_id);
+        if (latest_stream_it != latest_offsets.end()) {
+            const auto latest_offset_it = latest_stream_it->second.find(partition_id);
+            if (latest_offset_it != latest_stream_it->second.end()) {
+                existing_latest_offset = &latest_offset_it->second;
+            }
+        }
+        if (existing_latest_offset == nullptr) {
+            txn->put(latest_offset_key, offset_val);
+            ++num_writes;
+        } else if (existing_latest_offset->SerializeAsString() != offset_val) {
+            code = MetaServiceCode::INVALID_ARGUMENT;
+            msg = fmt::format("table stream offset {} was initialized differently", partition_id);
+            return;
+        }
+
+        if (is_versioned_write) {
+            const std::string versioned_offset_key =
+                    versioned::table_stream_offset_key(offset_key_info);
+            const TableStreamOffsetPB* existing_versioned_offset = nullptr;
+            const auto versioned_stream_it = versioned_offsets.find(stream_id);
+            if (versioned_stream_it != versioned_offsets.end()) {
+                const auto versioned_offset_it = versioned_stream_it->second.find(partition_id);
+                if (versioned_offset_it != versioned_stream_it->second.end()) {
+                    existing_versioned_offset = &versioned_offset_it->second;
+                }
+            }
+            if (existing_versioned_offset == nullptr) {
+                versioned_put(txn, versioned_offset_key, offset_val);
+                ++num_writes;
+            } else if (existing_versioned_offset->SerializeAsString() != offset_val) {
+                code = MetaServiceCode::INVALID_ARGUMENT;
+                msg = fmt::format("versioned table stream offset {} was initialized differently",
+                                  partition_id);
+                return;
+            }
+        }
+    }
+
+    if (num_writes == 0) {
+        return;
+    }
+    err = txn->commit();
+    if (err != TxnErrorCode::TXN_OK) {
+        code = cast_as<ErrCategory::COMMIT>(err);
+        msg = fmt::format("failed to commit table stream offsets: {}", err);
+    }
+}
+
 void MetaServiceImpl::commit_partition_internal(const PartitionRequest* request,
                                                 const std::string& instance_id,
                                                 const std::vector<int64_t>& partition_ids,
@@ -998,192 +1191,8 @@ void MetaServiceImpl::commit_partition_internal(const PartitionRequest* request,
     };
 
     if (request->object_type() == IndexObjectTypePB::TABLE_STREAM) {
-        MultiVersionStatus multi_version_status;
-        TableStreamReadResult status_result = read_table_stream_multi_version_status(
-                txn.get(), instance_id, TableStreamReadIntent::CONFLICT, &multi_version_status);
-        if (!status_result.ok()) {
-            code = status_result.code;
-            msg = std::move(status_result.message);
-            return;
-        }
-        const bool is_versioned_write = is_table_stream_versioned_write(multi_version_status);
-        const int64_t stream_id = request->index_ids(0);
-
-        std::string recycle_index_val;
-        err = txn->get(recycle_index_key({instance_id, stream_id}), &recycle_index_val);
-        const bool create_in_progress = err == TxnErrorCode::TXN_OK;
-        if (err != TxnErrorCode::TXN_OK && err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
-            code = cast_as<ErrCategory::READ>(err);
-            msg = fmt::format("failed to read table stream recycle index, err={}", err);
-            return;
-        }
-        RecycleIndexPB recycle_index;
-        if (create_in_progress) {
-            if (!recycle_index.ParseFromString(recycle_index_val)) {
-                code = MetaServiceCode::PROTOBUF_PARSE_ERR;
-                msg = "malformed table stream recycle index value";
-                return;
-            }
-            if (!table_stream_recycle_index_matches(recycle_index, *request)) {
-                code = MetaServiceCode::INVALID_ARGUMENT;
-                msg = "table stream partition commit does not match PREPARED index";
-                return;
-            }
-        }
-
-        std::unordered_map<int64_t, const TableStreamOffsetPB*> offsets;
-        offsets.reserve(request->table_stream_offsets_size());
-        for (const auto& offset : request->table_stream_offsets()) {
-            offsets.emplace(offset.partition_id(), &offset);
-        }
-
-        TableStreamIdentityPB identity;
-        identity.set_base_db_id(request->db_id());
-        identity.set_base_table_id(request->table_id());
-        identity.set_stream_db_id(request->stream_db_id());
-        identity.set_stream_id(stream_id);
-
-        TableStreamPartitionSetPB binding;
-        binding.mutable_identity()->CopyFrom(identity);
-        for (int64_t partition_id : partition_ids) {
-            binding.add_partition_ids(partition_id);
-        }
-        const std::vector<TableStreamPartitionSetPB> bindings {binding};
-
-        CloneChainReader clone_chain_reader(instance_id, resource_mgr_.get());
-        TableStreamMetadataReader metadata_reader(txn.get(), instance_id, multi_version_status,
-                                                  &clone_chain_reader);
-        if (!create_in_progress) {
-            TableStreamOffsetMap committed_offsets;
-            TableStreamReadResult read_result = metadata_reader.read_latest_offsets(
-                    bindings, TableStreamReadIntent::CONFLICT, &committed_offsets);
-            if (!read_result.ok()) {
-                code = read_result.code;
-                msg = std::move(read_result.message);
-                return;
-            }
-            const auto stream_it = committed_offsets.find(stream_id);
-            for (int64_t partition_id : partition_ids) {
-                if (stream_it == committed_offsets.end() ||
-                    !stream_it->second.contains(partition_id)) {
-                    code = MetaServiceCode::INVALID_ARGUMENT;
-                    msg = fmt::format(
-                            "table stream create is not in progress and offset {} is missing",
-                            partition_id);
-                    return;
-                }
-            }
-            return;
-        }
-
-        TableStreamPartitionVersionMap source_versions;
-        TableStreamReadResult read_result = metadata_reader.read_and_validate_partitions(
-                bindings, TableStreamReadIntent::CONFLICT, &source_versions);
-        if (!read_result.ok()) {
-            code = read_result.code;
-            msg = std::move(read_result.message);
-            return;
-        }
-
-        TableStreamOffsetMap latest_offsets;
-        read_result = metadata_reader.read_latest_offsets(bindings, TableStreamReadIntent::CONFLICT,
-                                                          &latest_offsets);
-        if (!read_result.ok()) {
-            code = read_result.code;
-            msg = std::move(read_result.message);
-            return;
-        }
-
-        TableStreamOffsetMap versioned_offsets;
-        if (is_versioned_write) {
-            read_result = metadata_reader.read_local_versioned_offsets(
-                    bindings, TableStreamReadIntent::CONFLICT, &versioned_offsets);
-            if (!read_result.ok()) {
-                code = read_result.code;
-                msg = std::move(read_result.message);
-                return;
-            }
-        }
-
-        size_t num_writes = 0;
-        for (size_t i = 0; i < partition_ids.size(); ++i) {
-            int64_t partition_id = partition_ids[i];
-            auto offset_it = offsets.find(partition_id);
-            DCHECK(offset_it != offsets.end());
-            const TableStreamOffsetPB& offset = *offset_it->second;
-
-            const auto& stream_versions = source_versions.at(stream_id);
-            auto source_version_it = stream_versions.find(partition_id);
-            DCHECK(source_version_it != stream_versions.end());
-            const VersionPB& source_version = source_version_it->second;
-            if (offset.offset_tso() > source_version.visible_tso()) {
-                code = MetaServiceCode::INVALID_ARGUMENT;
-                msg = fmt::format("initial offset exceeds visible TSO for partition {}",
-                                  partition_id);
-                return;
-            }
-
-            std::string offset_val;
-            if (!offset.SerializeToString(&offset_val)) {
-                code = MetaServiceCode::PROTOBUF_SERIALIZE_ERR;
-                msg = "failed to serialize table stream offset";
-                return;
-            }
-
-            TableStreamOffsetKeyInfo offset_key_info {instance_id,         request->db_id(),
-                                                      request->table_id(), request->stream_db_id(),
-                                                      stream_id,           partition_id};
-            const std::string latest_offset_key = table_stream_offset_key(offset_key_info);
-            const TableStreamOffsetPB* existing_latest_offset = nullptr;
-            const auto latest_stream_it = latest_offsets.find(stream_id);
-            if (latest_stream_it != latest_offsets.end()) {
-                const auto latest_offset_it = latest_stream_it->second.find(partition_id);
-                if (latest_offset_it != latest_stream_it->second.end()) {
-                    existing_latest_offset = &latest_offset_it->second;
-                }
-            }
-            if (existing_latest_offset == nullptr) {
-                txn->put(latest_offset_key, offset_val);
-                ++num_writes;
-            } else if (existing_latest_offset->SerializeAsString() != offset_val) {
-                code = MetaServiceCode::INVALID_ARGUMENT;
-                msg = fmt::format("table stream offset {} was initialized differently",
-                                  partition_id);
-                return;
-            }
-
-            if (is_versioned_write) {
-                const std::string versioned_offset_key =
-                        versioned::table_stream_offset_key(offset_key_info);
-                const TableStreamOffsetPB* existing_versioned_offset = nullptr;
-                const auto versioned_stream_it = versioned_offsets.find(stream_id);
-                if (versioned_stream_it != versioned_offsets.end()) {
-                    const auto versioned_offset_it = versioned_stream_it->second.find(partition_id);
-                    if (versioned_offset_it != versioned_stream_it->second.end()) {
-                        existing_versioned_offset = &versioned_offset_it->second;
-                    }
-                }
-                if (existing_versioned_offset == nullptr) {
-                    versioned_put(txn.get(), versioned_offset_key, offset_val);
-                    ++num_writes;
-                } else if (existing_versioned_offset->SerializeAsString() != offset_val) {
-                    code = MetaServiceCode::INVALID_ARGUMENT;
-                    msg = fmt::format(
-                            "versioned table stream offset {} was initialized differently",
-                            partition_id);
-                    return;
-                }
-            }
-        }
-
-        if (num_writes == 0) {
-            return;
-        }
-        err = txn->commit();
-        if (err != TxnErrorCode::TXN_OK) {
-            code = cast_as<ErrCategory::COMMIT>(err);
-            msg = fmt::format("failed to commit table stream offsets: {}", err);
-        }
+        commit_table_stream_partition_internal(txn.get(), request, instance_id, partition_ids, code,
+                                               msg);
         return;
     }
 

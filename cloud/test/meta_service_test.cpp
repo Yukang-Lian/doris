@@ -13495,6 +13495,36 @@ TEST(MetaServiceTest, TableStreamCreateDisabled) {
     PartitionRequest partition_request = make_table_stream_partition_request(
             db_id, table_id, stream_db_id, stream_id, partition_ids);
     PartitionResponse partition_response;
+    PartitionRequest mismatched_partition_request = partition_request;
+    mismatched_partition_request.set_stream_db_id(stream_db_id + 1);
+    meta_service->commit_partition(&ctrl, &mismatched_partition_request, &partition_response,
+                                   nullptr);
+    ASSERT_EQ(partition_response.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    EXPECT_NE(partition_response.status().msg().find(fmt::format("stream_id={}", stream_id)),
+              std::string::npos);
+    EXPECT_NE(partition_response.status().msg().find(
+                      fmt::format("prepared metadata (state=PREPARED, object_type=TABLE_STREAM, "
+                                  "base_db_id={}, base_table_id={}, stream_db_id={})",
+                                  db_id, table_id, stream_db_id)),
+              std::string::npos);
+    EXPECT_NE(partition_response.status().msg().find(
+                      fmt::format("request (base_db_id={}, base_table_id={}, stream_db_id={})",
+                                  db_id, table_id, stream_db_id + 1)),
+              std::string::npos);
+    EXPECT_NE(partition_response.status().msg().find(
+                      "request is stale or the metadata is inconsistent"),
+              std::string::npos);
+    ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    EXPECT_EQ(txn->get(table_stream_offset_key({instance_id, db_id, table_id, stream_db_id,
+                                                stream_id, partition_ids.front()}),
+                       &value),
+              TxnErrorCode::TXN_KEY_NOT_FOUND);
+    EXPECT_EQ(txn->get(table_stream_offset_key({instance_id, db_id, table_id, stream_db_id + 1,
+                                                stream_id, partition_ids.front()}),
+                       &value),
+              TxnErrorCode::TXN_KEY_NOT_FOUND);
+
+    partition_response.Clear();
     meta_service->commit_partition(&ctrl, &partition_request, &partition_response, nullptr);
     ASSERT_EQ(partition_response.status().code(), MetaServiceCode::OK)
             << partition_response.status().DebugString();
@@ -13576,6 +13606,9 @@ TEST(MetaServiceTest, TableStreamCreateDisabled) {
     index_response.Clear();
     meta_service->prepare_index(&ctrl, &index_request, &index_response, nullptr);
     EXPECT_EQ(index_response.status().code(), MetaServiceCode::OK);
+    ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    EXPECT_EQ(txn->get(recycle_index_key({instance_id, stream_id}), &value),
+              TxnErrorCode::TXN_KEY_NOT_FOUND);
 
     const int64_t empty_stream_id = stream_id + 1;
     IndexRequest empty_stream_request =
