@@ -17,6 +17,7 @@
 
 package org.apache.doris.catalog;
 
+import org.apache.doris.catalog.stream.OlapTableStream;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ExceptionChecker;
@@ -29,6 +30,9 @@ import org.apache.doris.utframe.TestWithFeService;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+
+import java.util.HashSet;
+import java.util.Set;
 
 public class DropTableStreamTest extends TestWithFeService {
 
@@ -102,6 +106,83 @@ public class DropTableStreamTest extends TestWithFeService {
         } finally {
             Config.cloud_unique_id = previousCloudUniqueId;
         }
+    }
+
+    @Test
+    public void testDropDatabaseRemovesOwnedStream() throws Exception {
+        String dbName = "test_stream_drop_database";
+        createDatabase(dbName);
+        createBinlogTable(dbName + ".tbl");
+        createTableStream(dbName + ".s", dbName + ".tbl");
+
+        Database db = (Database) Env.getCurrentInternalCatalog().getDbOrMetaException(dbName);
+        long streamId = db.getTableOrMetaException("s").getId();
+        Assertions.assertTrue(Env.getCurrentEnv().getTableStreamManager()
+                .getTableStreamIds(db).contains(streamId));
+
+        dropDatabase(dbName);
+
+        Assertions.assertFalse(Env.getCurrentInternalCatalog().getDb(dbName).isPresent());
+        Assertions.assertFalse(Env.getCurrentEnv().getTableStreamManager()
+                .getTableStreamIds(db).contains(streamId));
+        assertTableInRecycleBin(streamId);
+    }
+
+    @Test
+    public void testCrossDatabaseBaseDropKeepsStreamAndStreamStillRecycles() throws Exception {
+        String baseDbName = "test_stream_cross_base";
+        String streamDbName = "test_stream_cross_owner";
+        createDatabase(baseDbName);
+        createDatabase(streamDbName);
+        createBinlogTable(baseDbName + ".tbl");
+        createTableStream(streamDbName + ".s", baseDbName + ".tbl");
+
+        Database baseDb = (Database) Env.getCurrentInternalCatalog().getDbOrMetaException(baseDbName);
+        Database streamDb = (Database) Env.getCurrentInternalCatalog().getDbOrMetaException(streamDbName);
+        OlapTableStream stream = (OlapTableStream) streamDb.getTableOrMetaException("s");
+        long streamId = stream.getId();
+
+        dropTableWithSql("drop table " + baseDbName + ".tbl force");
+
+        Assertions.assertNull(baseDb.getTableNullable("tbl"));
+        Assertions.assertSame(stream, streamDb.getTableOrMetaException("s"));
+        Assertions.assertNull(stream.getBaseTableInfo().getTableNullable());
+        Assertions.assertTrue(Env.getCurrentEnv().getTableStreamManager()
+                .getTableStreamIds(streamDb).contains(streamId));
+
+        dropStream("drop stream " + streamDbName + ".s");
+
+        Assertions.assertNull(streamDb.getTableNullable("s"));
+        Assertions.assertFalse(Env.getCurrentEnv().getTableStreamManager()
+                .getTableStreamIds(streamDb).contains(streamId));
+        assertTableInRecycleBin(streamId);
+
+        dropDatabase(baseDbName);
+        dropDatabase(streamDbName);
+    }
+
+    private void createBinlogTable(String qualifiedTableName) throws Exception {
+        createTable("create table " + qualifiedTableName + " (\n"
+                + "  k1 int,\n"
+                + "  k2 int\n"
+                + ")\n"
+                + "unique key(k1)\n"
+                + "distributed by hash(k1) buckets 1\n"
+                + "properties('replication_num' = '1', 'binlog.enable' = 'true', "
+                + "'binlog.format' = 'ROW', 'binlog.need_historical_value' = 'true')");
+    }
+
+    private void createTableStream(String qualifiedStreamName, String qualifiedBaseTableName) throws Exception {
+        createTable("create stream " + qualifiedStreamName + " on table " + qualifiedBaseTableName
+                + " properties('show_initial_rows' = 'true')");
+    }
+
+    private void assertTableInRecycleBin(long tableId) {
+        Set<Long> dbIds = new HashSet<>();
+        Set<Long> tableIds = new HashSet<>();
+        Set<Long> partitionIds = new HashSet<>();
+        Env.getCurrentRecycleBin().getRecycleIds(dbIds, tableIds, partitionIds);
+        Assertions.assertTrue(tableIds.contains(tableId));
     }
 
     @Override

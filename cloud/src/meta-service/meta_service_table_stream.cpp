@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "cpp/sync_point.h"
 #include "meta-service/meta_service_helper.h"
 #include "meta-service/table_stream_metadata_reader.h"
 #include "meta-store/clone_chain_reader.h"
@@ -126,6 +127,7 @@ TableStreamReadResult read_bindings(const TableStreamMetadataReader& reader,
     if (!result.ok()) {
         return result;
     }
+    TEST_SYNC_POINT("get_table_stream_offset::after_read_partition_versions");
 
     TableStreamOffsetMap offsets;
     result = reader.read_effective_offsets(bindings, TableStreamReadIntent::SNAPSHOT, &offsets);

@@ -2571,6 +2571,35 @@ TEST(RecycleOperationLogTest, RecycleDeletedInstance) {
     }
 
     {
+        // Put Table Stream latest/versioned offsets and recycle task.
+        constexpr int64_t stream_db_id = 6;
+        constexpr int64_t stream_id = 7;
+        TableStreamOffsetPB offset;
+        offset.set_partition_id(partition_id);
+        offset.set_state(TABLE_STREAM_OFFSET_CONSUMED);
+        offset.set_offset_tso(100);
+        RecycleIndexPB recycle_index;
+        recycle_index.set_db_id(db_id);
+        recycle_index.set_table_id(table_id);
+        recycle_index.set_stream_db_id(stream_db_id);
+        recycle_index.set_object_type(TABLE_STREAM);
+        recycle_index.set_state(RecycleIndexPB::RECYCLING);
+
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        txn->put(table_stream_offset_key(
+                         {instance_id, db_id, table_id, stream_db_id, stream_id, partition_id}),
+                 offset.SerializeAsString());
+        versioned_put(txn.get(),
+                      versioned::table_stream_offset_key(
+                              {instance_id, db_id, table_id, stream_db_id, stream_id, partition_id}),
+                      offset.SerializeAsString());
+        txn->put(recycle_index_key({instance_id, stream_id}),
+                 recycle_index.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    {
         // Mark instance deleted.
         InstanceInfoPB deleted_instance = instance;
         deleted_instance.set_status(InstanceInfoPB::DELETED);

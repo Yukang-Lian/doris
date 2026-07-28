@@ -125,6 +125,123 @@ public class CloudInternalCatalogTableStreamTest {
         Assertions.assertTrue(exception.getMessage().contains("visible TSO API"));
     }
 
+    @Test
+    public void testCreateStopsWhenPartitionCommitFails() throws Exception {
+        String previousCloudUniqueId = Config.cloud_unique_id;
+        String previousMetaServiceEndpoint = Config.meta_service_endpoint;
+        Config.cloud_unique_id = "cloud_table_stream_ut";
+        Config.meta_service_endpoint = "127.0.0.1:20121";
+        try {
+            Cloud.TableStreamOffsetPB offset = Cloud.TableStreamOffsetPB.newBuilder()
+                    .setPartitionId(1)
+                    .setState(Cloud.TableStreamOffsetStatePB.TABLE_STREAM_OFFSET_CONSUMED)
+                    .setOffsetTso(101)
+                    .build();
+            TestCloudInternalCatalog catalog = new TestCloudInternalCatalog(List.of(offset));
+            Database streamDb = Mockito.mock(Database.class);
+            Mockito.when(streamDb.getId()).thenReturn(30L);
+            OlapTable baseTable = Mockito.mock(OlapTable.class);
+            Mockito.when(baseTable.getId()).thenReturn(20L);
+            Mockito.when(baseTable.getPartitionIds()).thenReturn(List.of(1L));
+            OlapTableStream stream = mockStream(10, 20, 40);
+
+            MetaServiceProxy proxy = Mockito.mock(MetaServiceProxy.class);
+            Cloud.IndexResponse okIndexResponse = Cloud.IndexResponse.newBuilder()
+                    .setStatus(Cloud.MetaServiceResponseStatus.newBuilder().setCode(Cloud.MetaServiceCode.OK))
+                    .build();
+            Cloud.PartitionResponse failedPartitionResponse = Cloud.PartitionResponse.newBuilder()
+                    .setStatus(Cloud.MetaServiceResponseStatus.newBuilder()
+                            .setCode(Cloud.MetaServiceCode.INVALID_ARGUMENT)
+                            .setMsg("partition commit failed"))
+                    .build();
+            try (MockedStatic<MetaServiceProxy> mockedProxy = Mockito.mockStatic(MetaServiceProxy.class)) {
+                mockedProxy.when(MetaServiceProxy::getInstance).thenReturn(proxy);
+                Mockito.when(proxy.prepareIndex(Mockito.any())).thenReturn(okIndexResponse);
+                Mockito.when(proxy.commitPartition(Mockito.any())).thenReturn(failedPartitionResponse);
+
+                DdlException exception = Assertions.assertThrows(DdlException.class,
+                        () -> catalog.runBeforeCreate(streamDb, stream, baseTable));
+
+                Assertions.assertTrue(exception.getMessage().contains("partition commit failed"));
+                Mockito.verify(proxy).prepareIndex(Mockito.any());
+                Mockito.verify(proxy).commitPartition(Mockito.any());
+                Mockito.verify(proxy, Mockito.never()).commitIndex(Mockito.any());
+            }
+        } finally {
+            Config.cloud_unique_id = previousCloudUniqueId;
+            Config.meta_service_endpoint = previousMetaServiceEndpoint;
+        }
+    }
+
+    @Test
+    public void testBeforeEraseTableStreamBuildsTypedDropRequest() throws Exception {
+        String previousCloudUniqueId = Config.cloud_unique_id;
+        String previousMetaServiceEndpoint = Config.meta_service_endpoint;
+        Config.cloud_unique_id = "cloud_table_stream_ut";
+        Config.meta_service_endpoint = "127.0.0.1:20121";
+        try {
+            CloudInternalCatalog catalog = new CloudInternalCatalog();
+            OlapTableStream stream = mockStream(10, 20, 40);
+            MetaServiceProxy proxy = Mockito.mock(MetaServiceProxy.class);
+            Cloud.IndexResponse response = Cloud.IndexResponse.newBuilder()
+                    .setStatus(Cloud.MetaServiceResponseStatus.newBuilder().setCode(Cloud.MetaServiceCode.OK))
+                    .build();
+            try (MockedStatic<MetaServiceProxy> mockedProxy = Mockito.mockStatic(MetaServiceProxy.class)) {
+                mockedProxy.when(MetaServiceProxy::getInstance).thenReturn(proxy);
+                Mockito.when(proxy.dropIndex(Mockito.any())).thenReturn(response);
+
+                catalog.beforeEraseTable(30, stream, false);
+
+                ArgumentCaptor<Cloud.IndexRequest> requestCaptor =
+                        ArgumentCaptor.forClass(Cloud.IndexRequest.class);
+                Mockito.verify(proxy).dropIndex(requestCaptor.capture());
+                Cloud.IndexRequest request = requestCaptor.getValue();
+                Assertions.assertEquals(Cloud.IndexObjectTypePB.TABLE_STREAM, request.getObjectType());
+                Assertions.assertEquals(10, request.getDbId());
+                Assertions.assertEquals(20, request.getTableId());
+                Assertions.assertEquals(30, request.getStreamDbId());
+                Assertions.assertEquals(List.of(40L), request.getIndexIdsList());
+
+                catalog.beforeEraseTable(30, stream, true);
+                Mockito.verifyNoMoreInteractions(proxy);
+            }
+        } finally {
+            Config.cloud_unique_id = previousCloudUniqueId;
+            Config.meta_service_endpoint = previousMetaServiceEndpoint;
+        }
+    }
+
+    @Test
+    public void testBeforeEraseTableStreamPropagatesDropFailure() throws Exception {
+        String previousCloudUniqueId = Config.cloud_unique_id;
+        String previousMetaServiceEndpoint = Config.meta_service_endpoint;
+        Config.cloud_unique_id = "cloud_table_stream_ut";
+        Config.meta_service_endpoint = "127.0.0.1:20121";
+        try {
+            CloudInternalCatalog catalog = new CloudInternalCatalog();
+            OlapTableStream stream = mockStream(10, 20, 40);
+            MetaServiceProxy proxy = Mockito.mock(MetaServiceProxy.class);
+            Cloud.IndexResponse response = Cloud.IndexResponse.newBuilder()
+                    .setStatus(Cloud.MetaServiceResponseStatus.newBuilder()
+                            .setCode(Cloud.MetaServiceCode.INVALID_ARGUMENT)
+                            .setMsg("drop failed"))
+                    .build();
+            try (MockedStatic<MetaServiceProxy> mockedProxy = Mockito.mockStatic(MetaServiceProxy.class)) {
+                mockedProxy.when(MetaServiceProxy::getInstance).thenReturn(proxy);
+                Mockito.when(proxy.dropIndex(Mockito.any())).thenReturn(response);
+
+                DdlException exception = Assertions.assertThrows(DdlException.class,
+                        () -> catalog.beforeEraseTable(30, stream, false));
+
+                Assertions.assertTrue(exception.getMessage().contains("drop failed"));
+                Mockito.verify(proxy).dropIndex(Mockito.any());
+            }
+        } finally {
+            Config.cloud_unique_id = previousCloudUniqueId;
+            Config.meta_service_endpoint = previousMetaServiceEndpoint;
+        }
+    }
+
     private static OlapTableStream mockStream(long baseDbId, long baseTableId, long streamId) {
         TableStreamBaseTableInfo baseTableInfo = Mockito.mock(TableStreamBaseTableInfo.class);
         Mockito.when(baseTableInfo.getDbId()).thenReturn(baseDbId);

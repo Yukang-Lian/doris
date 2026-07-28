@@ -19,18 +19,24 @@
 #include <gen_cpp/cloud.pb.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/config.h"
 #include "common/defer.h"
 #include "common/lexical_util.h"
+#include "cpp/sync_point.h"
 #include "meta-service/meta_service.h"
 #include "meta-store/keys.h"
 #include "meta-store/txn_kv.h"
@@ -48,6 +54,13 @@ extern TxnErrorCode read_operation_log(Transaction* txn, std::string_view log_ke
 
 class MetaServiceTableStreamTest : public ::testing::Test {
 protected:
+    static constexpr int64_t kTargetDbId = 3001;
+    static constexpr int64_t kTargetTableId = 3002;
+    static constexpr int64_t kTargetIndexId = 3003;
+    static constexpr int64_t kTargetPartitionId = 3004;
+    static constexpr int64_t kTargetTabletId = 3005;
+    static constexpr int64_t kBaseIndexId = 1005;
+
     void SetUp() override {
         service_ = get_meta_service(false);
         instance_id_ = "table_stream_read_state_instance";
@@ -147,9 +160,9 @@ protected:
         BeginTxnRequest request;
         request.set_cloud_unique_id(cloud_unique_id_);
         TxnInfoPB* txn_info = request.mutable_txn_info();
-        txn_info->set_db_id(3001);
+        txn_info->set_db_id(kTargetDbId);
         txn_info->set_label(label);
-        txn_info->add_table_ids(3002);
+        txn_info->add_table_ids(kTargetTableId);
         txn_info->set_timeout_ms(36000);
         BeginTxnResponse response;
         brpc::Controller controller;
@@ -158,12 +171,77 @@ protected:
         return response.txn_id();
     }
 
+    void create_target_tablet() {
+        CreateTabletsRequest request;
+        request.set_cloud_unique_id(cloud_unique_id_);
+        request.set_db_id(kTargetDbId);
+        doris::TabletMetaCloudPB* tablet = request.add_tablet_metas();
+        tablet->set_table_id(kTargetTableId);
+        tablet->set_index_id(kTargetIndexId);
+        tablet->set_partition_id(kTargetPartitionId);
+        tablet->set_tablet_id(kTargetTabletId);
+        doris::TabletSchemaCloudPB* schema = tablet->mutable_schema();
+        schema->set_schema_version(0);
+        doris::RowsetMetaCloudPB* first_rowset = tablet->add_rs_metas();
+        first_rowset->set_rowset_id(0);
+        first_rowset->set_rowset_id_v2("table_stream_target_initial");
+        first_rowset->set_start_version(0);
+        first_rowset->set_end_version(1);
+        first_rowset->mutable_tablet_schema()->CopyFrom(*schema);
+
+        CreateTabletsResponse response;
+        brpc::Controller controller;
+        service_->create_tablets(&controller, &request, &response, nullptr);
+        ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+    }
+
+    void stage_target_rowset(int64_t txn_id) {
+        doris::RowsetMetaCloudPB rowset;
+        rowset.set_rowset_id(0);
+        rowset.set_rowset_id_v2("table_stream_target_" + std::to_string(txn_id));
+        rowset.set_tablet_id(kTargetTabletId);
+        rowset.set_partition_id(kTargetPartitionId);
+        rowset.set_index_id(kTargetIndexId);
+        rowset.set_txn_id(txn_id);
+        rowset.set_num_segments(1);
+        rowset.set_num_rows(10);
+        rowset.set_data_disk_size(100);
+        rowset.set_total_disk_size(100);
+        rowset.mutable_tablet_schema()->set_schema_version(0);
+        rowset.set_txn_expiration(std::numeric_limits<int64_t>::max());
+
+        CreateRowsetRequest request;
+        request.set_cloud_unique_id(cloud_unique_id_);
+        request.mutable_rowset_meta()->CopyFrom(rowset);
+        CreateRowsetResponse response;
+        brpc::Controller prepare_controller;
+        service_->prepare_rowset(&prepare_controller, &request, &response, nullptr);
+        ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+
+        response.Clear();
+        brpc::Controller commit_controller;
+        service_->commit_rowset(&commit_controller, &request, &response, nullptr);
+        ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+    }
+
+    TxnInfoPB get_target_transaction(int64_t txn_id) {
+        GetTxnRequest request;
+        request.set_cloud_unique_id(cloud_unique_id_);
+        request.set_db_id(kTargetDbId);
+        request.set_txn_id(txn_id);
+        GetTxnResponse response;
+        brpc::Controller controller;
+        service_->get_txn(&controller, &request, &response, nullptr);
+        EXPECT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+        return response.txn_info();
+    }
+
     CommitTxnRequest make_consume_request(int64_t txn_id, int64_t partition_id,
                                           TableStreamOffsetStatePB expected_state,
                                           int64_t expected_tso, int64_t next_tso) {
         CommitTxnRequest request;
         request.set_cloud_unique_id(cloud_unique_id_);
-        request.set_db_id(3001);
+        request.set_db_id(kTargetDbId);
         request.set_txn_id(txn_id);
         TableStreamUpdatePB* stream_update = request.add_table_stream_updates();
         stream_update->mutable_identity()->CopyFrom(identity_);
@@ -189,6 +267,51 @@ protected:
                                         int64_t expected_tso, int64_t next_tso) {
         return commit_transaction(
                 make_consume_request(txn_id, partition_id, expected_state, expected_tso, next_tso));
+    }
+
+    PartitionResponse drop_base_partition(int64_t partition_id) {
+        PartitionRequest request;
+        request.set_cloud_unique_id(cloud_unique_id_);
+        request.set_db_id(identity_.base_db_id());
+        request.set_table_id(identity_.base_table_id());
+        request.add_index_ids(kBaseIndexId);
+        request.add_partition_ids(partition_id);
+        request.add_table_streams()->CopyFrom(identity_);
+        request.set_expiration(0);
+        PartitionResponse response;
+        brpc::Controller controller;
+        service_->drop_partition(&controller, &request, &response, nullptr);
+        return response;
+    }
+
+    std::pair<CommitTxnResponse, CommitTxnResponse> commit_concurrently(
+            const CommitTxnRequest& first_request, const CommitTxnRequest& second_request) {
+        std::mutex mutex;
+        std::condition_variable cv;
+        int arrived = 0;
+        auto* sync_point = SyncPoint::get_instance();
+        DORIS_CLOUD_DEFER {
+            sync_point->disable_processing();
+            sync_point->clear_all_call_backs();
+        };
+        sync_point->set_call_back("commit_txn_immediately::before_commit", [&](auto&&) {
+            std::unique_lock lock(mutex);
+            ++arrived;
+            cv.notify_all();
+            EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds(30), [&] { return arrived == 2; }));
+        });
+        sync_point->enable_processing();
+
+        CommitTxnResponse first_response;
+        CommitTxnResponse second_response;
+        std::thread first_thread(
+                [&] { first_response = commit_transaction(first_request); });
+        std::thread second_thread(
+                [&] { second_response = commit_transaction(second_request); });
+        first_thread.join();
+        second_thread.join();
+        EXPECT_EQ(arrived, 2);
+        return {std::move(first_response), std::move(second_response)};
     }
 
     TableStreamOffsetPB get_latest_offset(const TableStreamIdentityPB& identity,
@@ -284,6 +407,75 @@ TEST_F(MetaServiceTableStreamTest, ReadLatestAndUnknownOffsets) {
     EXPECT_FALSE(unknown.has_offset_tso());
     EXPECT_EQ(unknown.end_tso(), 140);
     EXPECT_EQ(unknown.visible_version(), 9);
+}
+
+TEST_F(MetaServiceTableStreamTest, ReadVersionAndOffsetFromOneSnapshot) {
+    set_multi_version_status(MULTI_VERSION_DISABLED);
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    put_latest_partition_state(txn.get(), 2001, 8, 130, 100);
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    auto* sync_point = SyncPoint::get_instance();
+    DORIS_CLOUD_DEFER {
+        sync_point->disable_processing();
+        sync_point->clear_all_call_backs();
+    };
+    bool updated = false;
+    sync_point->set_call_back("get_table_stream_offset::after_read_partition_versions",
+                              [&](auto&&) {
+                                  ASSERT_FALSE(updated);
+                                  updated = true;
+                                  std::unique_ptr<Transaction> update_txn;
+                                  ASSERT_EQ(service_->txn_kv()->create_txn(&update_txn),
+                                            TxnErrorCode::TXN_OK);
+                                  put_latest_partition_state(update_txn.get(), 2001, 9, 140, 110);
+                                  ASSERT_EQ(update_txn->commit(), TxnErrorCode::TXN_OK);
+                              });
+    sync_point->enable_processing();
+
+    GetTableStreamOffsetResponse response = get_read_state({2001});
+    ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+    ASSERT_TRUE(updated);
+    ASSERT_EQ(response.bindings_size(), 1);
+    ASSERT_EQ(response.bindings(0).partition_states_size(), 1);
+    const TableStreamPartitionReadStatePB& state = response.bindings(0).partition_states(0);
+    EXPECT_EQ(state.visible_version(), 8);
+    EXPECT_EQ(state.end_tso(), 130);
+    EXPECT_EQ(state.offset_tso(), 100);
+
+    sync_point->disable_processing();
+    sync_point->clear_all_call_backs();
+    response = get_read_state({2001});
+    ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+    const TableStreamPartitionReadStatePB& next_state =
+            response.bindings(0).partition_states(0);
+    EXPECT_EQ(next_state.visible_version(), 9);
+    EXPECT_EQ(next_state.end_tso(), 140);
+    EXPECT_EQ(next_state.offset_tso(), 110);
+}
+
+TEST_F(MetaServiceTableStreamTest, UnknownStreamIdReliesOnFeCatalogAuthority) {
+    set_multi_version_status(MULTI_VERSION_DISABLED);
+    identity_.set_stream_id(9999);
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    put_latest_partition_state(txn.get(), 2001, 8, 130, std::nullopt);
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    GetTableStreamOffsetResponse response = get_read_state({2001});
+    ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+    ASSERT_EQ(response.bindings_size(), 1);
+    ASSERT_EQ(response.bindings(0).partition_states_size(), 1);
+    EXPECT_EQ(response.bindings(0).partition_states(0).offset_state(),
+              TABLE_STREAM_OFFSET_UNKNOWN);
+
+    CommitTxnResponse commit_response =
+            consume_partition(begin_target_transaction("consume-fe-authoritative-stream"), 2001,
+                              TABLE_STREAM_OFFSET_UNKNOWN, 0, 120);
+    ASSERT_EQ(commit_response.status().code(), MetaServiceCode::OK)
+            << commit_response.status().msg();
+    EXPECT_EQ(get_latest_offset(2001).offset_tso(), 120);
 }
 
 TEST_F(MetaServiceTableStreamTest, ReadVersionedState) {
@@ -428,6 +620,15 @@ TEST_F(MetaServiceTableStreamTest, ReadWriteOnlyState) {
     std::unique_ptr<Transaction> txn;
     ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
     put_latest_partition_state(txn.get(), 2001, 28, 330, 300);
+    TableStreamOffsetPB stale_versioned_offset;
+    stale_versioned_offset.set_partition_id(2001);
+    stale_versioned_offset.set_state(TABLE_STREAM_OFFSET_CONSUMED);
+    stale_versioned_offset.set_offset_tso(250);
+    const std::string versioned_offset_key = versioned::table_stream_offset_key(
+            {instance_id_, identity_.base_db_id(), identity_.base_table_id(),
+             identity_.stream_db_id(), identity_.stream_id(), 2001});
+    txn->enable_get_versionstamp();
+    versioned_put(txn.get(), versioned_offset_key, stale_versioned_offset.SerializeAsString());
     ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
 
     GetTableStreamOffsetResponse response = get_read_state({2001});
@@ -439,6 +640,22 @@ TEST_F(MetaServiceTableStreamTest, ReadWriteOnlyState) {
     EXPECT_EQ(state.offset_tso(), 300);
     EXPECT_EQ(state.end_tso(), 330);
     EXPECT_EQ(state.visible_version(), 28);
+
+    CommitTxnResponse commit_response =
+            consume_partition(begin_target_transaction("consume-write-only"), 2001,
+                              TABLE_STREAM_OFFSET_CONSUMED, 300, 320);
+    ASSERT_EQ(commit_response.status().code(), MetaServiceCode::OK)
+            << commit_response.status().msg();
+    EXPECT_EQ(get_latest_offset(2001).offset_tso(), 320);
+
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    Versionstamp offset_version;
+    std::string value;
+    ASSERT_EQ(versioned_get(txn.get(), versioned_offset_key, &offset_version, &value),
+              TxnErrorCode::TXN_OK);
+    TableStreamOffsetPB versioned_offset;
+    ASSERT_TRUE(versioned_offset.ParseFromString(value));
+    EXPECT_EQ(versioned_offset.offset_tso(), 320);
 }
 
 TEST_F(MetaServiceTableStreamTest, RejectDuplicateBindingsAndPartitions) {
@@ -518,6 +735,368 @@ TEST_F(MetaServiceTableStreamTest, CommitUpdatesLatestOffsetAndIsIdempotent) {
     response = consume_partition(txn_id, 2002, TABLE_STREAM_OFFSET_UNKNOWN, 0, 140);
     ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
     EXPECT_EQ(get_latest_offset(2002).offset_tso(), 140);
+}
+
+TEST_F(MetaServiceTableStreamTest, CommitTargetRowsetAndOffsetAtomicallyAndIdempotently) {
+    set_multi_version_status(MULTI_VERSION_WRITE_ONLY);
+    create_target_tablet();
+
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    put_latest_partition_state(txn.get(), 2001, 8, 130, std::nullopt);
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    put_auto_versioned_offset(instance_id_, identity_, 2001, 100, true);
+    const std::string versioned_offset_key = versioned::table_stream_offset_key(
+            {instance_id_, identity_.base_db_id(), identity_.base_table_id(),
+             identity_.stream_db_id(), identity_.stream_id(), 2001});
+    auto get_versioned_offset = [&]() {
+        std::unique_ptr<Transaction> read_txn;
+        EXPECT_EQ(service_->txn_kv()->create_txn(&read_txn), TxnErrorCode::TXN_OK);
+        Versionstamp version;
+        std::string value;
+        EXPECT_EQ(versioned_get(read_txn.get(), versioned_offset_key, &version, &value),
+                  TxnErrorCode::TXN_OK);
+        TableStreamOffsetPB offset;
+        EXPECT_TRUE(offset.ParseFromString(value));
+        return offset;
+    };
+
+    const int64_t txn_id = begin_target_transaction("consume-target-rowset-atomically");
+    stage_target_rowset(txn_id);
+    const std::string target_rowset_key =
+            meta_rowset_key({instance_id_, kTargetTabletId, 2});
+    const std::string next_target_rowset_key =
+            meta_rowset_key({instance_id_, kTargetTabletId, 3});
+    const std::string tmp_rowset_key =
+            meta_rowset_tmp_key({instance_id_, txn_id, kTargetTabletId});
+    const std::string target_version_key = partition_version_key(
+            {instance_id_, kTargetDbId, kTargetTableId, kTargetPartitionId});
+
+    CommitTxnRequest stale_request =
+            make_consume_request(txn_id, 2001, TABLE_STREAM_OFFSET_CONSUMED, 99, 120);
+    CommitTxnResponse response = commit_transaction(stale_request);
+    EXPECT_EQ(response.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    EXPECT_EQ(get_target_transaction(txn_id).status(), TxnStatusPB::TXN_STATUS_PREPARED);
+    EXPECT_EQ(get_latest_offset(2001).offset_tso(), 100);
+    EXPECT_EQ(get_versioned_offset().offset_tso(), 100);
+
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    std::string value;
+    EXPECT_EQ(txn->get(target_rowset_key, &value), TxnErrorCode::TXN_KEY_NOT_FOUND);
+    EXPECT_EQ(txn->get(target_version_key, &value), TxnErrorCode::TXN_KEY_NOT_FOUND);
+    EXPECT_EQ(txn->get(tmp_rowset_key, &value), TxnErrorCode::TXN_OK);
+
+    CommitTxnRequest request =
+            make_consume_request(txn_id, 2001, TABLE_STREAM_OFFSET_CONSUMED, 100, 120);
+    response = commit_transaction(request);
+    ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+    EXPECT_EQ(get_target_transaction(txn_id).status(), TxnStatusPB::TXN_STATUS_VISIBLE);
+    const TableStreamOffsetPB committed_offset = get_latest_offset(2001);
+    ASSERT_EQ(committed_offset.offset_tso(), 120);
+    const TableStreamOffsetPB committed_versioned_offset = get_versioned_offset();
+    ASSERT_EQ(committed_versioned_offset.offset_tso(), 120);
+
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    std::string committed_rowset;
+    ASSERT_EQ(txn->get(target_rowset_key, &committed_rowset), TxnErrorCode::TXN_OK);
+    EXPECT_EQ(txn->get(next_target_rowset_key, &value), TxnErrorCode::TXN_KEY_NOT_FOUND);
+    EXPECT_EQ(txn->get(tmp_rowset_key, &value), TxnErrorCode::TXN_KEY_NOT_FOUND);
+    ASSERT_EQ(txn->get(target_version_key, &value), TxnErrorCode::TXN_OK);
+    VersionPB target_version;
+    ASSERT_TRUE(target_version.ParseFromString(value));
+    EXPECT_EQ(target_version.version(), 2);
+
+    response = commit_transaction(request);
+    ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+    EXPECT_EQ(get_target_transaction(txn_id).status(), TxnStatusPB::TXN_STATUS_VISIBLE);
+    EXPECT_EQ(get_latest_offset(2001).SerializeAsString(), committed_offset.SerializeAsString());
+    EXPECT_EQ(get_versioned_offset().SerializeAsString(),
+              committed_versioned_offset.SerializeAsString());
+
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    ASSERT_EQ(txn->get(target_rowset_key, &value), TxnErrorCode::TXN_OK);
+    EXPECT_EQ(value, committed_rowset);
+    EXPECT_EQ(txn->get(next_target_rowset_key, &value), TxnErrorCode::TXN_KEY_NOT_FOUND);
+    ASSERT_EQ(txn->get(target_version_key, &value), TxnErrorCode::TXN_OK);
+    ASSERT_TRUE(target_version.ParseFromString(value));
+    EXPECT_EQ(target_version.version(), 2);
+}
+
+TEST_F(MetaServiceTableStreamTest, CommitSourceVersionUsesSnapshotRead) {
+    set_multi_version_status(MULTI_VERSION_DISABLED);
+    create_target_tablet();
+
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    put_latest_partition_state(txn.get(), 2001, 8, 130, 100);
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    const int64_t txn_id = begin_target_transaction("consume-while-source-publishes");
+    stage_target_rowset(txn_id);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool commit_ready = false;
+    bool resume_commit = false;
+    auto* sync_point = SyncPoint::get_instance();
+    sync_point->set_call_back("commit_txn_immediately::before_commit", [&](auto&&) {
+        std::unique_lock lock(mutex);
+        commit_ready = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return resume_commit; });
+    });
+    sync_point->enable_processing();
+
+    CommitTxnResponse response;
+    std::thread commit_thread([&] {
+        response = consume_partition(
+                txn_id, 2001, TABLE_STREAM_OFFSET_CONSUMED, 100, 120);
+    });
+    DORIS_CLOUD_DEFER {
+        {
+            std::lock_guard lock(mutex);
+            resume_commit = true;
+        }
+        cv.notify_all();
+        if (commit_thread.joinable()) {
+            commit_thread.join();
+        }
+        sync_point->disable_processing();
+        sync_point->clear_all_call_backs();
+    };
+
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(30), [&] { return commit_ready; }));
+    }
+
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    put_latest_partition_state(txn.get(), 2001, 9, 140, std::nullopt);
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    {
+        std::lock_guard lock(mutex);
+        resume_commit = true;
+    }
+    cv.notify_all();
+    commit_thread.join();
+
+    ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+    EXPECT_EQ(get_latest_offset(2001).offset_tso(), 120);
+    EXPECT_EQ(get_target_transaction(txn_id).status(), TxnStatusPB::TXN_STATUS_VISIBLE);
+
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    std::string value;
+    EXPECT_EQ(txn->get(meta_rowset_key({instance_id_, kTargetTabletId, 2}), &value),
+              TxnErrorCode::TXN_OK);
+}
+
+TEST_F(MetaServiceTableStreamTest, CreatePartitionCommitConflictsWithPartitionRecycle) {
+    set_multi_version_status(MULTI_VERSION_DISABLED);
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    put_latest_partition_state(txn.get(), 2001, 8, 130, std::nullopt);
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    IndexRequest prepare_request;
+    prepare_request.set_cloud_unique_id(cloud_unique_id_);
+    prepare_request.set_db_id(identity_.base_db_id());
+    prepare_request.set_table_id(identity_.base_table_id());
+    prepare_request.set_stream_db_id(identity_.stream_db_id());
+    prepare_request.add_index_ids(identity_.stream_id());
+    prepare_request.set_object_type(TABLE_STREAM);
+    prepare_request.set_expiration(0);
+    IndexResponse prepare_response;
+    brpc::Controller prepare_controller;
+    service_->prepare_index(&prepare_controller, &prepare_request, &prepare_response, nullptr);
+    ASSERT_EQ(prepare_response.status().code(), MetaServiceCode::OK)
+            << prepare_response.status().msg();
+
+    auto* sync_point = SyncPoint::get_instance();
+    DORIS_CLOUD_DEFER {
+        sync_point->disable_processing();
+        sync_point->clear_all_call_backs();
+    };
+    bool recycle_partition_written = false;
+    sync_point->set_call_back("commit_table_stream_partition::before_commit", [&](auto&&) {
+        ASSERT_FALSE(recycle_partition_written);
+        PartitionResponse response = drop_base_partition(2001);
+        ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+        recycle_partition_written = true;
+    });
+    sync_point->enable_processing();
+
+    PartitionRequest partition_request;
+    partition_request.set_cloud_unique_id(cloud_unique_id_);
+    partition_request.set_db_id(identity_.base_db_id());
+    partition_request.set_table_id(identity_.base_table_id());
+    partition_request.set_stream_db_id(identity_.stream_db_id());
+    partition_request.add_index_ids(identity_.stream_id());
+    partition_request.set_object_type(TABLE_STREAM);
+    partition_request.add_partition_ids(2001);
+    TableStreamOffsetPB* offset = partition_request.add_table_stream_offsets();
+    offset->set_partition_id(2001);
+    offset->set_state(TABLE_STREAM_OFFSET_CONSUMED);
+    offset->set_offset_tso(100);
+    PartitionResponse partition_response;
+    brpc::Controller partition_controller;
+    service_->commit_partition(&partition_controller, &partition_request, &partition_response,
+                               nullptr);
+
+    EXPECT_NE(partition_response.status().code(), MetaServiceCode::OK);
+    EXPECT_TRUE(recycle_partition_written);
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    std::string value;
+    EXPECT_EQ(txn->get(table_stream_offset_key(
+                               {instance_id_, identity_.base_db_id(), identity_.base_table_id(),
+                                identity_.stream_db_id(), identity_.stream_id(), 2001}),
+                       &value),
+              TxnErrorCode::TXN_KEY_NOT_FOUND);
+    ASSERT_EQ(txn->get(recycle_index_key({instance_id_, identity_.stream_id()}), &value),
+              TxnErrorCode::TXN_OK);
+    RecycleIndexPB recycle_index;
+    ASSERT_TRUE(recycle_index.ParseFromString(value));
+    EXPECT_EQ(recycle_index.state(), RecycleIndexPB::PREPARED);
+}
+
+TEST_F(MetaServiceTableStreamTest, ConcurrentConsumersSerializeExistingOffset) {
+    set_multi_version_status(MULTI_VERSION_DISABLED);
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    put_latest_partition_state(txn.get(), 2001, 8, 130, 100);
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    const int64_t first_txn_id = begin_target_transaction("consume-existing-offset-first");
+    const int64_t second_txn_id = begin_target_transaction("consume-existing-offset-second");
+    auto [first_response, second_response] = commit_concurrently(
+            make_consume_request(first_txn_id, 2001, TABLE_STREAM_OFFSET_CONSUMED, 100, 120),
+            make_consume_request(second_txn_id, 2001, TABLE_STREAM_OFFSET_CONSUMED, 100, 130));
+
+    const bool first_succeeded = first_response.status().code() == MetaServiceCode::OK;
+    const bool second_succeeded = second_response.status().code() == MetaServiceCode::OK;
+    EXPECT_NE(first_succeeded, second_succeeded);
+    EXPECT_EQ(get_latest_offset(2001).offset_tso(), first_succeeded ? 120 : 130);
+    EXPECT_EQ(get_target_transaction(first_txn_id).status(),
+              first_succeeded ? TxnStatusPB::TXN_STATUS_VISIBLE
+                              : TxnStatusPB::TXN_STATUS_PREPARED);
+    EXPECT_EQ(get_target_transaction(second_txn_id).status(),
+              second_succeeded ? TxnStatusPB::TXN_STATUS_VISIBLE
+                               : TxnStatusPB::TXN_STATUS_PREPARED);
+}
+
+TEST_F(MetaServiceTableStreamTest, ConcurrentFirstConsumersSerializeMissingOffset) {
+    set_multi_version_status(MULTI_VERSION_DISABLED);
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    put_latest_partition_state(txn.get(), 2001, 8, 130, std::nullopt);
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    const int64_t first_txn_id = begin_target_transaction("consume-missing-offset-first");
+    const int64_t second_txn_id = begin_target_transaction("consume-missing-offset-second");
+    auto [first_response, second_response] = commit_concurrently(
+            make_consume_request(first_txn_id, 2001, TABLE_STREAM_OFFSET_UNKNOWN, 0, 120),
+            make_consume_request(second_txn_id, 2001, TABLE_STREAM_OFFSET_UNKNOWN, 0, 130));
+
+    const bool first_succeeded = first_response.status().code() == MetaServiceCode::OK;
+    const bool second_succeeded = second_response.status().code() == MetaServiceCode::OK;
+    EXPECT_NE(first_succeeded, second_succeeded);
+    EXPECT_EQ(get_latest_offset(2001).offset_tso(), first_succeeded ? 120 : 130);
+    EXPECT_EQ(get_target_transaction(first_txn_id).status(),
+              first_succeeded ? TxnStatusPB::TXN_STATUS_VISIBLE
+                              : TxnStatusPB::TXN_STATUS_PREPARED);
+    EXPECT_EQ(get_target_transaction(second_txn_id).status(),
+              second_succeeded ? TxnStatusPB::TXN_STATUS_VISIBLE
+                               : TxnStatusPB::TXN_STATUS_PREPARED);
+}
+
+TEST_F(MetaServiceTableStreamTest, CommitConflictsWithConcurrentPartitionRecycle) {
+    set_multi_version_status(MULTI_VERSION_DISABLED);
+    create_target_tablet();
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    put_latest_partition_state(txn.get(), 2001, 8, 130, 100);
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    const int64_t txn_id = begin_target_transaction("consume-while-partition-recycled");
+    stage_target_rowset(txn_id);
+    auto* sync_point = SyncPoint::get_instance();
+    DORIS_CLOUD_DEFER {
+        sync_point->disable_processing();
+        sync_point->clear_all_call_backs();
+    };
+    bool recycle_partition_written = false;
+    sync_point->set_call_back("commit_txn_immediately::before_commit", [&](auto&&) {
+        ASSERT_FALSE(recycle_partition_written);
+        PartitionResponse drop_response = drop_base_partition(2001);
+        ASSERT_EQ(drop_response.status().code(), MetaServiceCode::OK)
+                << drop_response.status().msg();
+        recycle_partition_written = true;
+    });
+    sync_point->enable_processing();
+
+    CommitTxnResponse response = consume_partition(
+            txn_id, 2001, TABLE_STREAM_OFFSET_CONSUMED, 100, 120);
+    EXPECT_NE(response.status().code(), MetaServiceCode::OK);
+    EXPECT_TRUE(recycle_partition_written);
+    EXPECT_EQ(get_target_transaction(txn_id).status(), TxnStatusPB::TXN_STATUS_PREPARED);
+    EXPECT_EQ(get_latest_offset(2001).offset_tso(), 100);
+
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    std::string value;
+    EXPECT_EQ(txn->get(meta_rowset_key({instance_id_, kTargetTabletId, 2}), &value),
+              TxnErrorCode::TXN_KEY_NOT_FOUND);
+    EXPECT_EQ(txn->get(meta_rowset_tmp_key({instance_id_, txn_id, kTargetTabletId}), &value),
+              TxnErrorCode::TXN_OK);
+}
+
+TEST_F(MetaServiceTableStreamTest, CommitConflictsAfterStreamRecycleIndexIsCreated) {
+    set_multi_version_status(MULTI_VERSION_DISABLED);
+    create_target_tablet();
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    put_latest_partition_state(txn.get(), 2001, 8, 130, 100);
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    const int64_t txn_id = begin_target_transaction("consume-while-stream-dropped");
+    stage_target_rowset(txn_id);
+    auto* sync_point = SyncPoint::get_instance();
+    DORIS_CLOUD_DEFER {
+        sync_point->disable_processing();
+        sync_point->clear_all_call_backs();
+    };
+    bool stream_dropped = false;
+    sync_point->set_call_back("commit_txn_immediately::before_commit", [&](auto&&) {
+        ASSERT_FALSE(stream_dropped);
+        IndexRequest drop_request;
+        drop_request.set_cloud_unique_id(cloud_unique_id_);
+        drop_request.add_index_ids(identity_.stream_id());
+        drop_request.set_db_id(identity_.base_db_id());
+        drop_request.set_table_id(identity_.base_table_id());
+        drop_request.set_object_type(IndexObjectTypePB::TABLE_STREAM);
+        drop_request.set_stream_db_id(identity_.stream_db_id());
+        drop_request.set_expiration(0);
+        IndexResponse drop_response;
+        brpc::Controller drop_controller;
+        service_->drop_index(&drop_controller, &drop_request, &drop_response, nullptr);
+        ASSERT_EQ(drop_response.status().code(), MetaServiceCode::OK)
+                << drop_response.status().msg();
+        stream_dropped = true;
+    });
+    sync_point->enable_processing();
+
+    CommitTxnResponse response = consume_partition(
+            txn_id, 2001, TABLE_STREAM_OFFSET_CONSUMED, 100, 120);
+    EXPECT_NE(response.status().code(), MetaServiceCode::OK);
+    EXPECT_TRUE(stream_dropped);
+    EXPECT_EQ(get_target_transaction(txn_id).status(), TxnStatusPB::TXN_STATUS_PREPARED);
+    EXPECT_EQ(get_latest_offset(2001).offset_tso(), 100);
+
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    std::string value;
+    EXPECT_EQ(txn->get(meta_rowset_key({instance_id_, kTargetTabletId, 2}), &value),
+              TxnErrorCode::TXN_KEY_NOT_FOUND);
+    EXPECT_EQ(txn->get(meta_rowset_tmp_key({instance_id_, txn_id, kTargetTabletId}), &value),
+              TxnErrorCode::TXN_OK);
 }
 
 TEST_F(MetaServiceTableStreamTest, CommitMultipleStreamsAtomically) {
@@ -623,6 +1202,26 @@ TEST_F(MetaServiceTableStreamTest, CommitRejectsStaleAndInvalidOffsets) {
     txn_id = begin_target_transaction("consume-beyond-visible-tso");
     response = consume_partition(txn_id, 2001, TABLE_STREAM_OFFSET_CONSUMED, 100, 131);
     EXPECT_EQ(response.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    EXPECT_EQ(get_latest_offset(2001).offset_tso(), 100);
+}
+
+TEST_F(MetaServiceTableStreamTest, CommitRejectsDuplicatePartitionUpdates) {
+    set_multi_version_status(MULTI_VERSION_DISABLED);
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(service_->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+    put_latest_partition_state(txn.get(), 2001, 8, 130, 100);
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    const int64_t txn_id = begin_target_transaction("consume-duplicate-partition-update");
+    CommitTxnRequest request =
+            make_consume_request(txn_id, 2001, TABLE_STREAM_OFFSET_CONSUMED, 100, 120);
+    TableStreamPartitionUpdatePB duplicate_update =
+            request.table_stream_updates(0).partition_updates(0);
+    request.mutable_table_stream_updates(0)->add_partition_updates()->CopyFrom(duplicate_update);
+
+    CommitTxnResponse response = commit_transaction(request);
+    EXPECT_EQ(response.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    EXPECT_EQ(get_target_transaction(txn_id).status(), TxnStatusPB::TXN_STATUS_PREPARED);
     EXPECT_EQ(get_latest_offset(2001).offset_tso(), 100);
 }
 
@@ -794,14 +1393,44 @@ TEST_F(MetaServiceTableStreamTest, CommitRejectsUnsupportedTxnModesAndForcesImme
     request.add_sub_txn_infos()->set_sub_txn_id(1);
     EXPECT_EQ(commit_transaction(request).status().code(), MetaServiceCode::INVALID_ARGUMENT);
 
-    int old_fuzzy_possibility = config::cloud_txn_lazy_commit_fuzzy_possibility;
+    const int old_fuzzy_possibility = config::cloud_txn_lazy_commit_fuzzy_possibility;
+    DORIS_CLOUD_DEFER {
+        config::cloud_txn_lazy_commit_fuzzy_possibility = old_fuzzy_possibility;
+    };
     config::cloud_txn_lazy_commit_fuzzy_possibility = 100;
     request = make_consume_request(begin_target_transaction("consume-immediate"), 2001,
                                    TABLE_STREAM_OFFSET_CONSUMED, 100, 120);
     request.set_enable_txn_lazy_commit(true);
     CommitTxnResponse response = commit_transaction(request);
-    config::cloud_txn_lazy_commit_fuzzy_possibility = old_fuzzy_possibility;
     ASSERT_EQ(response.status().code(), MetaServiceCode::OK) << response.status().msg();
+    EXPECT_EQ(get_latest_offset(2001).offset_tso(), 120);
+
+    bool immediate_commit_hit = false;
+    bool eventual_commit_hit = false;
+    auto* sync_point = SyncPoint::get_instance();
+    DORIS_CLOUD_DEFER {
+        sync_point->disable_processing();
+        sync_point->clear_all_call_backs();
+    };
+    sync_point->set_call_back("commit_txn_immediately::before_commit", [&](auto&& args) {
+        *try_any_cast<TxnErrorCode*>(args[0]) = TxnErrorCode::TXN_BYTES_TOO_LARGE;
+        *try_any_cast<MetaServiceCode*>(args[1]) = MetaServiceCode::INVALID_ARGUMENT;
+        *try_any_cast<bool*>(args.back()) = true;
+        immediate_commit_hit = true;
+    });
+    sync_point->set_call_back("commit_txn_eventually::finish",
+                              [&](auto&&) { eventual_commit_hit = true; });
+    sync_point->enable_processing();
+
+    const int64_t too_large_txn_id = begin_target_transaction("consume-too-large");
+    request = make_consume_request(too_large_txn_id, 2001, TABLE_STREAM_OFFSET_CONSUMED, 120, 130);
+    request.set_enable_txn_lazy_commit(true);
+    response = commit_transaction(request);
+    EXPECT_EQ(response.status().code(), MetaServiceCode::INVALID_ARGUMENT);
+    EXPECT_TRUE(immediate_commit_hit);
+    EXPECT_FALSE(eventual_commit_hit);
+    EXPECT_EQ(get_target_transaction(too_large_txn_id).status(),
+              TxnStatusPB::TXN_STATUS_PREPARED);
     EXPECT_EQ(get_latest_offset(2001).offset_tso(), 120);
 }
 
